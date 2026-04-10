@@ -3,8 +3,11 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +16,30 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// blindIndexSalt domain-separates the HMAC sub-key from the AES encryption
+// key so that blind-index tokens are independent from ciphertext operations.
+const blindIndexSalt = "blind_index_v1"
+
+// BlindIndex returns a deterministic hex-encoded HMAC-SHA256 of value keyed
+// by a sub-key derived from encKey.  The result allows SQL equality matching
+// on sensitive fields while the primary storage remains randomized AES-GCM.
+//
+// encKey must be exactly 32 bytes (the AES-256 key used for EncryptField).
+// Returns an empty string if encKey is not exactly 32 bytes.
+func BlindIndex(encKey []byte, value string) string {
+	if len(encKey) != 32 {
+		return ""
+	}
+	// Derive a domain-specific sub-key.
+	prk := hmac.New(sha256.New, encKey)
+	prk.Write([]byte(blindIndexSalt))
+	indexKey := prk.Sum(nil)
+
+	mac := hmac.New(sha256.New, indexKey)
+	mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 // EncryptField encrypts plaintext using AES-256-GCM with the supplied 32-byte
 // key.  The nonce is prepended to the ciphertext and the whole thing is
@@ -78,6 +105,17 @@ func DecryptField(key []byte, ciphertext string) (string, error) {
 	return string(plaintext), nil
 }
 
+// GenerateRandomPassword returns a cryptographically-random URL-safe password
+// of approximately 22 characters (16 random bytes, base64-URL encoded without
+// padding).  Use it to bootstrap secrets that must never be a known value.
+func GenerateRandomPassword() (string, error) {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", fmt.Errorf("crypto: generate random password: %w", err)
+	}
+	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b), nil
+}
+
 // HashPassword hashes password using bcrypt at cost 12.
 func HashPassword(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
@@ -122,6 +160,53 @@ func MaskName(name string) string {
 		}
 	}
 	return sb.String()
+}
+
+// Soundex returns the American Soundex phonetic code for name.  The code
+// consists of the first letter of the normalized name followed by three digits
+// encoding consonant groups.  Names that sound alike produce the same code,
+// enabling fuzzy-match duplicate detection without storing plaintext.
+//
+// Non-letter characters and spaces are stripped so that "John Doe" and
+// "JohnDoe" produce the same result.  Input is case-insensitive.
+func Soundex(name string) string {
+	var runes []rune
+	for _, r := range []rune(strings.ToUpper(name)) {
+		if r >= 'A' && r <= 'Z' {
+			runes = append(runes, r)
+		}
+	}
+	if len(runes) == 0 {
+		return ""
+	}
+
+	// Soundex code table indexed by letter offset from 'A'.
+	// 0 = ignored (vowels, H, W, Y); 1–6 = consonant groups.
+	const codeTable = "01230120022455012623010202"
+	code := func(r rune) byte { return codeTable[r-'A'] }
+
+	result := make([]byte, 1, 4)
+	result[0] = byte(runes[0])
+	prev := code(runes[0])
+
+	for i := 1; i < len(runes) && len(result) < 4; i++ {
+		c := code(runes[i])
+		if c == '0' {
+			// Vowel / ignored: acts as separator so the same code on both
+			// sides of a vowel is still emitted twice.
+			prev = '0'
+			continue
+		}
+		if c != prev {
+			result = append(result, c)
+			prev = c
+		}
+	}
+
+	for len(result) < 4 {
+		result = append(result, '0')
+	}
+	return string(result)
 }
 
 // MaskID masks all but the last four characters of id with asterisks.

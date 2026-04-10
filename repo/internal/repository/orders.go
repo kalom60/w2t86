@@ -10,10 +10,12 @@ import (
 )
 
 // OrderItemInput carries the data needed to create one order line item.
+// UnitPrice is intentionally absent: the authoritative price is fetched from
+// the materials table inside the Create transaction so clients cannot tamper
+// with order totals or GMV figures.
 type OrderItemInput struct {
 	MaterialID int64
 	Qty        int
-	UnitPrice  float64
 }
 
 // OrderRepository provides database operations for orders, order items,
@@ -71,34 +73,47 @@ func (r *OrderRepository) Create(userID int64, items []OrderItemInput) (*models.
 		}
 	}
 
-	// 2. Calculate total amount.
+	// 2. Fetch authoritative prices from the catalog and calculate total.
+	// Prices are never accepted from the client — fetching inside the same
+	// transaction guarantees consistency with the reservation above.
+	const priceQ = `SELECT price FROM materials WHERE id = ? AND deleted_at IS NULL`
+	type itemPrice struct {
+		input     OrderItemInput
+		unitPrice float64
+	}
+	priced := make([]itemPrice, 0, len(items))
 	var total float64
 	for _, it := range items {
-		total += float64(it.Qty) * it.UnitPrice
+		var unitPrice float64
+		if err := tx.QueryRow(priceQ, it.MaterialID).Scan(&unitPrice); err != nil {
+			return nil, fmt.Errorf("repository: Create order: fetch price material %d: %w", it.MaterialID, err)
+		}
+		total += float64(it.Qty) * unitPrice
+		priced = append(priced, itemPrice{input: it, unitPrice: unitPrice})
 	}
 
 	// 3. Insert the order (auto_close_at = now + 30 minutes).
 	const insertOrderQ = `
 		INSERT INTO orders (user_id, status, total_amount, auto_close_at)
 		VALUES (?, 'pending_payment', ?, datetime('now', '+30 minutes'))
-		RETURNING id, user_id, status, total_amount, auto_close_at, created_at, updated_at`
+		RETURNING id, user_id, status, total_amount, auto_close_at, created_at, updated_at, completed_at`
 
 	order := &models.Order{}
 	row := tx.QueryRow(insertOrderQ, userID, total)
 	if err := row.Scan(
 		&order.ID, &order.UserID, &order.Status, &order.TotalAmount,
-		&order.AutoCloseAt, &order.CreatedAt, &order.UpdatedAt,
+		&order.AutoCloseAt, &order.CreatedAt, &order.UpdatedAt, &order.CompletedAt,
 	); err != nil {
 		return nil, fmt.Errorf("repository: Create order: insert order: %w", err)
 	}
 
-	// 4. Insert order items.
+	// 4. Insert order items using the server-fetched unit prices.
 	const insertItemQ = `
 		INSERT INTO order_items (order_id, material_id, qty, unit_price, fulfillment_status)
 		VALUES (?, ?, ?, ?, 'pending')`
 
-	for _, it := range items {
-		if _, err := tx.Exec(insertItemQ, order.ID, it.MaterialID, it.Qty, it.UnitPrice); err != nil {
+	for _, ip := range priced {
+		if _, err := tx.Exec(insertItemQ, order.ID, ip.input.MaterialID, ip.input.Qty, ip.unitPrice); err != nil {
 			return nil, fmt.Errorf("repository: Create order: insert order_item: %w", err)
 		}
 	}
@@ -133,7 +148,7 @@ func (r *OrderRepository) Create(userID int64, items []OrderItemInput) (*models.
 // GetByID returns the order with the given ID.
 func (r *OrderRepository) GetByID(id int64) (*models.Order, error) {
 	const q = `
-		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at
+		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at, completed_at
 		FROM   orders
 		WHERE  id = ?`
 
@@ -168,7 +183,7 @@ func (r *OrderRepository) GetItemsByOrderID(orderID int64) ([]models.OrderItem, 
 // GetByUserID returns paginated orders for a specific user.
 func (r *OrderRepository) GetByUserID(userID int64, limit, offset int) ([]models.Order, error) {
 	const q = `
-		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at
+		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at, completed_at
 		FROM   orders
 		WHERE  user_id = ?
 		ORDER  BY created_at DESC
@@ -185,7 +200,7 @@ func (r *OrderRepository) GetByUserID(userID int64, limit, offset int) ([]models
 // GetByStatus returns paginated orders filtered by status.
 func (r *OrderRepository) GetByStatus(status string, limit, offset int) ([]models.Order, error) {
 	const q = `
-		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at
+		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at, completed_at
 		FROM   orders
 		WHERE  status = ?
 		ORDER  BY created_at DESC
@@ -244,7 +259,7 @@ func (r *OrderRepository) GetAll(status, dateFrom, dateTo string, limit, offset 
 	}
 
 	q := `
-		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at
+		SELECT id, user_id, status, total_amount, auto_close_at, created_at, updated_at, completed_at
 		FROM   orders
 		WHERE  ` + where + `
 		ORDER  BY created_at DESC
@@ -316,12 +331,19 @@ func (r *OrderRepository) Transition(orderID, actorID int64, toStatus, note stri
 		autoCloseExpr = "NULL"
 	}
 
+	// Stamp completed_at exactly once — when the order first reaches "completed".
+	// This timestamp is the authoritative anchor for the 14-day return window.
+	var completedAtExpr string
+	if toStatus == "completed" {
+		completedAtExpr = ", completed_at = datetime('now')"
+	}
+
 	updateOrderQ := fmt.Sprintf(`
 		UPDATE orders
-		SET    status       = ?,
+		SET    status        = ?,
 		       auto_close_at = %s,
-		       updated_at   = datetime('now')
-		WHERE  id = ?`, autoCloseExpr)
+		       updated_at    = datetime('now')%s
+		WHERE  id = ?`, autoCloseExpr, completedAtExpr)
 
 	if _, err := tx.Exec(updateOrderQ, toStatus, orderID); err != nil {
 		return fmt.Errorf("repository: Transition: update order: %w", err)
@@ -602,6 +624,120 @@ func (r *OrderRepository) ResolveReturn(id int64, resolvedBy int64, approved boo
 	return nil
 }
 
+// ApproveReturnWithFinancialRecord atomically approves a return request and
+// creates the corresponding financial_transactions row in the same database
+// transaction. If the financial record cannot be written the approval is rolled
+// back and the error is returned, maintaining strict audit linkage.
+func (r *OrderRepository) ApproveReturnWithFinancialRecord(
+	requestID, orderID, actorID int64,
+	txType string,
+	amount float64,
+	note string,
+) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("repository: ApproveReturnWithFinancialRecord: begin: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	const resolveQ = `
+		UPDATE return_requests
+		SET    status      = 'approved',
+		       resolved_at = datetime('now'),
+		       resolved_by = ?
+		WHERE  id = ? AND status = 'pending'`
+
+	res, err := tx.Exec(resolveQ, actorID, requestID)
+	if err != nil {
+		return fmt.Errorf("repository: ApproveReturnWithFinancialRecord: resolve: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("repository: ApproveReturnWithFinancialRecord: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("repository: ApproveReturnWithFinancialRecord: request %d not found or already resolved", requestID)
+	}
+
+	var notePtr *string
+	if note != "" {
+		notePtr = &note
+	}
+	const ftQ = `
+		INSERT INTO financial_transactions
+		            (order_id, return_request_id, type, amount, status, note, actor_id)
+		VALUES      (?, ?, ?, ?, 'pending', ?, ?)`
+
+	if _, err = tx.Exec(ftQ, orderID, requestID, txType, amount, notePtr, actorID); err != nil {
+		return fmt.Errorf("repository: ApproveReturnWithFinancialRecord: financial record: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// ConfirmPaymentWithReceipt atomically transitions an order from
+// pending_payment → pending_shipment and inserts a financial_transaction row
+// of type "receipt" in the same database transaction, so the audit trail is
+// never broken. If the financial record cannot be written the status change is
+// rolled back and the error returned.
+func (r *OrderRepository) ConfirmPaymentWithReceipt(orderID, actorID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Read current status and total_amount in one query.
+	var fromStatus string
+	var totalAmount float64
+	if err := tx.QueryRow(
+		`SELECT status, total_amount FROM orders WHERE id = ?`, orderID,
+	).Scan(&fromStatus, &totalAmount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("repository: ConfirmPaymentWithReceipt: order %d not found", orderID)
+		}
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: load order: %w", err)
+	}
+	if fromStatus != "pending_payment" {
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: order is %q, expected pending_payment", fromStatus)
+	}
+
+	// Advance status to pending_shipment (auto_close_at extended by 72 h).
+	if _, err := tx.Exec(`
+		UPDATE orders
+		SET    status        = 'pending_shipment',
+		       auto_close_at = datetime('now', '+72 hours'),
+		       updated_at    = datetime('now')
+		WHERE  id = ?`, orderID); err != nil {
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: update order: %w", err)
+	}
+
+	// Insert order_event.
+	note := "payment confirmed"
+	if _, err := tx.Exec(`
+		INSERT INTO order_events (order_id, from_status, to_status, actor_id, note)
+		VALUES (?, 'pending_payment', 'pending_shipment', ?, ?)`,
+		orderID, actorID, note); err != nil {
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: insert order_event: %w", err)
+	}
+
+	// Insert the financial receipt — links the payment to the order for audit.
+	ref := fmt.Sprintf("ORDER-%d", orderID)
+	if _, err := tx.Exec(`
+		INSERT INTO financial_transactions
+		            (order_id, type, amount, status, reference, note, actor_id)
+		VALUES      (?, 'receipt', ?, 'completed', ?, 'payment received', ?)`,
+		orderID, totalAmount, ref, actorID); err != nil {
+		return fmt.Errorf("repository: ConfirmPaymentWithReceipt: insert financial_transaction: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // ---------------------------------------------------------------
 // Auto-close (scheduler entry point)
 // ---------------------------------------------------------------
@@ -665,7 +801,7 @@ type orderScanner interface {
 
 func scanOrder(s orderScanner) (*models.Order, error) {
 	o := &models.Order{}
-	if err := s.Scan(&o.ID, &o.UserID, &o.Status, &o.TotalAmount, &o.AutoCloseAt, &o.CreatedAt, &o.UpdatedAt); err != nil {
+	if err := s.Scan(&o.ID, &o.UserID, &o.Status, &o.TotalAmount, &o.AutoCloseAt, &o.CreatedAt, &o.UpdatedAt, &o.CompletedAt); err != nil {
 		return nil, err
 	}
 	return o, nil
@@ -675,7 +811,7 @@ func scanOrders(rows *sql.Rows) ([]models.Order, error) {
 	var out []models.Order
 	for rows.Next() {
 		o := &models.Order{}
-		if err := rows.Scan(&o.ID, &o.UserID, &o.Status, &o.TotalAmount, &o.AutoCloseAt, &o.CreatedAt, &o.UpdatedAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.UserID, &o.Status, &o.TotalAmount, &o.AutoCloseAt, &o.CreatedAt, &o.UpdatedAt, &o.CompletedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, *o)
@@ -705,13 +841,25 @@ func (r *OrderRepository) DB() *sql.DB {
 
 // MarkOrderItemFulfilled sets the fulfillment_status of the order_item identified
 // by orderID + materialID to "fulfilled", provided it is currently "pending".
+// Returns an error when no matching pending row exists (the item may have already
+// been fulfilled, backordered, or the material/order combination is invalid).
 func (r *OrderRepository) MarkOrderItemFulfilled(orderID, materialID int64) error {
 	const q = `
 		UPDATE order_items
 		SET    fulfillment_status = 'fulfilled'
 		WHERE  order_id = ? AND material_id = ? AND fulfillment_status = 'pending'`
-	_, err := r.db.Exec(q, orderID, materialID)
-	return err
+	res, err := r.db.Exec(q, orderID, materialID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("repository: MarkOrderItemFulfilled: no pending order_item found for order %d material %d", orderID, materialID)
+	}
+	return nil
 }
 
 // MarkOrderItemBackordered sets the fulfillment_status of the order_item

@@ -59,6 +59,29 @@ func (wf *WordFilter) Contains(text string) (bool, string) {
 	return false, ""
 }
 
+// hrefURLRe matches an href= attribute whose value begins with an https?:// URL.
+// Consuming the URL here prevents double-counting the bare URL in the next pass.
+var hrefURLRe = regexp.MustCompile(`(?i)href\s*=\s*["']?https?://[^\s>"']*["']?`)
+
+// hrefBareRe matches any remaining href= (relative URLs, anchors) after
+// hrefURLRe matches have already been stripped.
+var hrefBareRe = regexp.MustCompile(`(?i)href\s*=`)
+
+// plainURLRe matches bare https?:// references not inside an href attribute.
+var plainURLRe = regexp.MustCompile(`(?i)https?://`)
+
+// countLinks counts unique link references in body, deduplicated so that
+// href=http://... is counted once (not twice as both an href and a bare URL).
+// This prevents the link-limit from being bypassed via plain URLs.
+func countLinks(body string) int {
+	n := len(hrefURLRe.FindAllString(body, -1))
+	remaining := hrefURLRe.ReplaceAllLiteralString(body, "")
+	n += len(hrefBareRe.FindAllString(remaining, -1))
+	remaining = hrefBareRe.ReplaceAllLiteralString(remaining, "")
+	n += len(plainURLRe.FindAllString(remaining, -1))
+	return n
+}
+
 // ---------------------------------------------------------------
 // MaterialService
 // ---------------------------------------------------------------
@@ -144,7 +167,7 @@ func (s *MaterialService) AddComment(materialID, userID int64, body string) (*mo
 		return nil, fmt.Errorf("comment body exceeds maximum length of %d characters", maxCommentLength)
 	}
 
-	linkCount := strings.Count(strings.ToLower(body), "href=")
+	linkCount := countLinks(body)
 	if linkCount > maxCommentLinks {
 		return nil, fmt.Errorf("comment may contain at most %d links", maxCommentLinks)
 	}
@@ -171,12 +194,14 @@ func (s *MaterialService) AddComment(materialID, userID int64, body string) (*mo
 	return comment, nil
 }
 
-// Rate records or updates a star rating (1–5) for a material.
+// Rate records a star rating (1–5) for a material.
+// Each student may rate a given material only once; a second attempt returns
+// repository.ErrAlreadyRated.
 func (s *MaterialService) Rate(materialID, userID int64, stars int) error {
 	if stars < 1 || stars > 5 {
 		return fmt.Errorf("stars must be between 1 and 5")
 	}
-	if err := s.engagementRepo.UpsertRating(materialID, userID, stars); err != nil {
+	if err := s.engagementRepo.InsertRating(materialID, userID, stars); err != nil {
 		return fmt.Errorf("service: Rate: %w", err)
 	}
 	return nil
@@ -354,6 +379,15 @@ func (s *MaterialService) GetListItems(listID int64) ([]models.FavoritesItem, er
 }
 
 // GetListByShareToken returns a favorites list by its share token.
+// Private lists are not accessible via share token regardless of whether the
+// token is valid; they are treated as if the token does not exist.
 func (s *MaterialService) GetListByShareToken(token string) (*models.FavoritesList, error) {
-	return s.engagementRepo.GetListByShareToken(token)
+	list, err := s.engagementRepo.GetListByShareToken(token)
+	if err != nil {
+		return nil, err
+	}
+	if list.Visibility == "private" {
+		return nil, sql.ErrNoRows
+	}
+	return list, nil
 }

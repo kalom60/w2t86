@@ -20,6 +20,48 @@
   </div>
 </div>
 
+<!-- Sections -->
+<div class="card mb-4">
+  <div class="card-header"><h3 class="h6 mb-0">Sections</h3></div>
+  <div class="card-body">
+    {{if .Sections}}
+    <ul class="list-group mb-3">
+      {{range .Sections}}
+      <li class="list-group-item">
+        <strong>{{.Name}}</strong>
+        {{if .Period}}<span class="text-muted ms-2">Period: {{.Period}}</span>{{end}}
+        {{if .Room}}<span class="text-muted ms-2">Room: {{.Room}}</span>{{end}}
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="text-muted small mb-3">No sections yet.</p>
+    {{end}}
+    <form hx-post="/courses/{{$course.ID}}/sections"
+          hx-target="#section-flash"
+          hx-swap="innerHTML">
+      <div id="section-flash"></div>
+      <div class="row g-2 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label form-label-sm" for="section-name">Section name</label>
+          <input class="form-control form-control-sm" id="section-name" name="name" placeholder="e.g. Period 1" required>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label form-label-sm" for="section-period">Period (optional)</label>
+          <input class="form-control form-control-sm" id="section-period" name="period" placeholder="e.g. 8:00 AM">
+        </div>
+        <div class="col-md-3">
+          <label class="form-label form-label-sm" for="section-room">Room (optional)</label>
+          <input class="form-control form-control-sm" id="section-room" name="room" placeholder="e.g. Room 101">
+        </div>
+        <div class="col-md-2">
+          <button class="btn btn-primary btn-sm w-100" type="submit">Add Section</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
 <!-- Material demand plan -->
 <div class="card mb-4">
   <div class="card-header d-flex align-items-center justify-content-between">
@@ -36,7 +78,7 @@
             <th>Requested Qty</th>
             <th>Approved Qty</th>
             <th>Status</th>
-            {{if eq $user.Role "admin"}}
+            {{if or (eq $user.Role "admin") (eq $user.Role "instructor")}}
             <th>Actions</th>
             {{end}}
           </tr>
@@ -58,7 +100,7 @@
               {{else}}<span class="badge bg-secondary">{{.Status}}</span>
               {{end}}
             </td>
-            {{if eq $user.Role "admin"}}
+            {{if or (eq $user.Role "admin") (eq $user.Role "instructor")}}
             <td>
               {{if eq .Status "pending"}}
               <form hx-post="/courses/{{$course.ID}}/plan/{{.ID}}/approve"

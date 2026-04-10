@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 
 	"w2t86/internal/models"
 )
@@ -441,6 +443,341 @@ func (r *AnalyticsRepository) ComputeGridAggregation(layerType, metric string, g
 	for cellKey, count := range counts {
 		if err := r.UpsertSpatialAggregate(layerType, cellKey, metric, count); err != nil {
 			return fmt.Errorf("analytics: ComputeGridAggregation: upsert %q: %w", cellKey, err)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------
+// Extended spatial analysis
+// ---------------------------------------------------------------
+
+// haversineKm returns the great-circle distance in kilometres between two
+// lat/lng points using the Haversine formula.
+func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadiusKm = 6371.0
+	dLat := (lat2 - lat1) * math.Pi / 180.0
+	dLng := (lng2 - lng1) * math.Pi / 180.0
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*math.Pi/180.0)*math.Cos(lat2*math.Pi/180.0)*
+			math.Sin(dLng/2)*math.Sin(dLng/2)
+	return earthRadiusKm * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+// LocationsWithinRadius returns all locations (optionally filtered by locType)
+// whose geodesic distance from (centerLat, centerLng) is ≤ radiusKm.
+// Uses the Haversine formula computed in Go (no spatial extension required).
+func (r *AnalyticsRepository) LocationsWithinRadius(centerLat, centerLng, radiusKm float64, locType string) ([]models.Location, error) {
+	all, err := r.GetLocations(locType)
+	if err != nil {
+		return nil, fmt.Errorf("analytics: LocationsWithinRadius: %w", err)
+	}
+
+	var out []models.Location
+	for _, loc := range all {
+		if loc.Lat == nil || loc.Lng == nil {
+			continue
+		}
+		if haversineKm(centerLat, centerLng, *loc.Lat, *loc.Lng) <= radiusKm {
+			out = append(out, loc)
+		}
+	}
+	return out, nil
+}
+
+// POIDensityWithinRadius counts the number of locations of each type within
+// radiusKm of (centerLat, centerLng).  Returns a map of locationType → count.
+func (r *AnalyticsRepository) POIDensityWithinRadius(centerLat, centerLng, radiusKm float64) (map[string]int, error) {
+	locs, err := r.LocationsWithinRadius(centerLat, centerLng, radiusKm, "")
+	if err != nil {
+		return nil, fmt.Errorf("analytics: POIDensityWithinRadius: %w", err)
+	}
+
+	density := make(map[string]int)
+	for _, loc := range locs {
+		t := "unknown"
+		if loc.Type != nil {
+			t = *loc.Type
+		}
+		density[t]++
+	}
+	return density, nil
+}
+
+// TrajectoryPoints returns the ordered sequence of distribution scan events
+// for a given material, forming its custody chain / trajectory.
+func (r *AnalyticsRepository) TrajectoryPoints(materialID int64) ([]models.TrajectoryPoint, error) {
+	const q = `
+		SELECT
+			COALESCE(scan_id, ''),
+			event_type,
+			COALESCE(custody_from, ''),
+			COALESCE(custody_to,   ''),
+			occurred_at
+		FROM   distribution_events
+		WHERE  material_id = ?
+		ORDER  BY occurred_at ASC`
+
+	rows, err := r.db.Query(q, materialID)
+	if err != nil {
+		return nil, fmt.Errorf("analytics: TrajectoryPoints: %w", err)
+	}
+	defer rows.Close()
+
+	var out []models.TrajectoryPoint
+	for rows.Next() {
+		var tp models.TrajectoryPoint
+		if err := rows.Scan(&tp.ScanID, &tp.EventType, &tp.CustodyFrom, &tp.CustodyTo, &tp.OccurredAt); err != nil {
+			return nil, fmt.Errorf("analytics: TrajectoryPoints scan: %w", err)
+		}
+		out = append(out, tp)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------
+// Point-in-Polygon (PiP) helpers for boundary-file containment
+// ---------------------------------------------------------------
+
+// parseWKTPolygon extracts the exterior ring from a WKT POLYGON string.
+// WKT coordinate order is longitude-first: "POLYGON((lng lat, lng lat, …))".
+// Returns a slice of [lat, lng] pairs, or nil if the string is not a valid polygon.
+func parseWKTPolygon(wkt string) [][2]float64 {
+	upper := strings.ToUpper(strings.TrimSpace(wkt))
+	open := strings.Index(upper, "((")
+	if open < 0 || !strings.HasPrefix(upper, "POLYGON") {
+		return nil
+	}
+	inner := wkt[open+2:]
+	end := strings.Index(inner, "))")
+	if end < 0 {
+		end = strings.Index(inner, ")")
+		if end < 0 {
+			return nil
+		}
+	}
+	inner = inner[:end]
+
+	parts := strings.Split(inner, ",")
+	ring := make([][2]float64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		var lng, lat float64
+		if n, _ := fmt.Sscanf(p, "%f %f", &lng, &lat); n == 2 {
+			ring = append(ring, [2]float64{lat, lng}) // store as [lat, lng]
+		}
+	}
+	if len(ring) < 3 {
+		return nil
+	}
+	return ring
+}
+
+// pointInPolygon tests whether the point (lat, lng) lies inside the polygon
+// ring using the ray-casting algorithm.  Ring vertices are [lat, lng] pairs.
+func pointInPolygon(lat, lng float64, ring [][2]float64) bool {
+	inside := false
+	n := len(ring)
+	j := n - 1
+	for i := 0; i < n; i++ {
+		iLat, iLng := ring[i][0], ring[i][1]
+		jLat, jLng := ring[j][0], ring[j][1]
+		if (iLat > lat) != (jLat > lat) &&
+			lng < (jLng-iLng)*(lat-iLat)/(jLat-iLat)+iLng {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
+}
+
+// regionEntry bundles a location with its parsed WKT polygon ring (when available).
+type regionEntry struct {
+	loc  models.Location
+	ring [][2]float64 // non-nil when geom_wkt contains a valid POLYGON
+}
+
+// assignRegion returns the admin-region that contains (lat, lng):
+//  1. Point-in-Polygon test on regions with a WKT boundary (first match wins).
+//  2. Nearest-centroid fallback for regions without a WKT boundary (or when
+//     no polygon contains the point).
+//
+// This eliminates the fixed-radius heuristic: every point is deterministically
+// assigned to exactly one region.
+func assignRegion(entries []regionEntry, lat, lng float64) *models.Location {
+	// Pass 1: deterministic polygon containment.
+	for i := range entries {
+		if entries[i].ring != nil && pointInPolygon(lat, lng, entries[i].ring) {
+			return &entries[i].loc
+		}
+	}
+	// Pass 2: nearest centroid for regions without boundary files.
+	var best *models.Location
+	bestDist := math.MaxFloat64
+	for i := range entries {
+		loc := &entries[i].loc
+		if loc.Lat == nil || loc.Lng == nil {
+			continue
+		}
+		if d := haversineKm(lat, lng, *loc.Lat, *loc.Lng); d < bestDist {
+			bestDist = d
+			best = loc
+		}
+	}
+	return best
+}
+
+// regionEventPoint is an internal type used during region-stats computation.
+type regionEventPoint struct {
+	id          int64
+	orderID     int64
+	custodyFrom string
+	custodyTo   string
+}
+
+// RegionStats aggregates order and distribution-scan counts per admin-region.
+//
+// Each non-region location referenced by a distribution event's custody_to or
+// custody_from field is assigned to an administrative region using the
+// assignRegion helper:
+//   - Point-in-Polygon containment when the region carries a WKT polygon boundary.
+//   - Nearest-centroid as a deterministic fallback when no boundary file exists.
+//
+// This replaces the former fixed-radius (50 km) heuristic.
+func (r *AnalyticsRepository) RegionStats() ([]models.RegionStat, error) {
+	// 1. Load all admin-region locations and parse their WKT polygons.
+	regions, err := r.GetLocations("admin_region")
+	if err != nil {
+		return nil, fmt.Errorf("analytics: RegionStats: fetch regions: %w", err)
+	}
+
+	entries := make([]regionEntry, len(regions))
+	for i, reg := range regions {
+		e := regionEntry{loc: reg}
+		if reg.GeomWKT != nil {
+			e.ring = parseWKTPolygon(*reg.GeomWKT)
+		}
+		entries[i] = e
+	}
+
+	// 2. Build name → (lat, lng) map for all non-region locations.
+	type locPt struct{ lat, lng float64 }
+	const locQ = `
+		SELECT name, lat, lng
+		FROM   locations
+		WHERE  (type IS NULL OR type != 'admin_region')
+		  AND  lat IS NOT NULL AND lng IS NOT NULL`
+	locRows, err := r.db.Query(locQ)
+	if err != nil {
+		return nil, fmt.Errorf("analytics: RegionStats: fetch locations: %w", err)
+	}
+	defer locRows.Close()
+	locByName := make(map[string]locPt)
+	for locRows.Next() {
+		var name string
+		var pt locPt
+		if err := locRows.Scan(&name, &pt.lat, &pt.lng); err != nil {
+			continue
+		}
+		locByName[name] = pt
+	}
+	locRows.Close()
+
+	// 3. Load all distribution events.
+	const deQ = `
+		SELECT id, COALESCE(order_id, 0),
+		       COALESCE(custody_from, ''), COALESCE(custody_to, '')
+		FROM   distribution_events`
+	deRows, err := r.db.Query(deQ)
+	if err != nil {
+		return nil, fmt.Errorf("analytics: RegionStats: fetch events: %w", err)
+	}
+	defer deRows.Close()
+	var events []regionEventPoint
+	for deRows.Next() {
+		var ev regionEventPoint
+		if err := deRows.Scan(&ev.id, &ev.orderID, &ev.custodyFrom, &ev.custodyTo); err != nil {
+			continue
+		}
+		events = append(events, ev)
+	}
+	deRows.Close()
+
+	// 4. Assign each custody location to a region; accumulate per-region counts.
+	//    location name → region ID
+	locRegion := make(map[string]int64)
+	for name, pt := range locByName {
+		reg := assignRegion(entries, pt.lat, pt.lng)
+		if reg != nil {
+			locRegion[name] = reg.ID
+		}
+	}
+
+	type regionCount struct{ orders, scans int }
+	regionAgg := make(map[int64]struct {
+		orderSet map[int64]bool
+		scans    int
+	})
+	for _, ev := range events {
+		for _, name := range []string{ev.custodyFrom, ev.custodyTo} {
+			regID, ok := locRegion[name]
+			if !ok || name == "" {
+				continue
+			}
+			rc := regionAgg[regID]
+			if rc.orderSet == nil {
+				rc.orderSet = make(map[int64]bool)
+			}
+			rc.scans++
+			if ev.orderID > 0 {
+				rc.orderSet[ev.orderID] = true
+			}
+			regionAgg[regID] = rc
+		}
+	}
+
+	// 5. Build the output slice (include all regions, even zero-count ones).
+	out := make([]models.RegionStat, 0, len(regions))
+	for _, reg := range regions {
+		if reg.Lat == nil || reg.Lng == nil {
+			continue
+		}
+		rc := regionAgg[reg.ID]
+		out = append(out, models.RegionStat{
+			RegionName: reg.Name,
+			OrderCount: len(rc.orderSet),
+			ScanCount:  rc.scans,
+			Lat:        *reg.Lat,
+			Lng:        *reg.Lng,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].RegionName < out[j].RegionName })
+	return out, nil
+}
+
+// ComputeRegionAggregation recomputes region-level spatial aggregates and
+// stores them in spatial_aggregates (layer_type='admin_region').  Uses the
+// same Haversine-based containment logic as RegionStats so results are consistent.
+func (r *AnalyticsRepository) ComputeRegionAggregation(metric string) error {
+	stats, err := r.RegionStats()
+	if err != nil {
+		return fmt.Errorf("analytics: ComputeRegionAggregation: %w", err)
+	}
+
+	for _, rs := range stats {
+		cellKey := fmt.Sprintf("%.6f,%.6f", rs.Lat, rs.Lng)
+		var value float64
+		switch metric {
+		case "orders":
+			value = float64(rs.OrderCount)
+		case "scans":
+			value = float64(rs.ScanCount)
+		default: // "count" or unknown — sum of both
+			value = float64(rs.OrderCount + rs.ScanCount)
+		}
+		if err := r.UpsertSpatialAggregate("admin_region", cellKey, metric, value); err != nil {
+			return fmt.Errorf("analytics: ComputeRegionAggregation: upsert %q: %w", cellKey, err)
 		}
 	}
 	return nil

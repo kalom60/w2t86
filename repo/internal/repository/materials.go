@@ -23,14 +23,14 @@ func NewMaterialRepository(db *sql.DB) *MaterialRepository {
 func (r *MaterialRepository) Create(m *models.Material) (*models.Material, error) {
 	const q = `
 		INSERT INTO materials (isbn, title, author, publisher, edition, subject, grade_level,
-		                       total_qty, available_qty, reserved_qty, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                       total_qty, available_qty, reserved_qty, price, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id, isbn, title, author, publisher, edition, subject, grade_level,
-		          total_qty, available_qty, reserved_qty, status, created_at, updated_at, deleted_at`
+		          total_qty, available_qty, reserved_qty, price, status, created_at, updated_at, deleted_at`
 
 	row := r.db.QueryRow(q,
 		m.ISBN, m.Title, m.Author, m.Publisher, m.Edition, m.Subject, m.GradeLevel,
-		m.TotalQty, m.AvailableQty, m.ReservedQty, m.Status,
+		m.TotalQty, m.AvailableQty, m.ReservedQty, m.Price, m.Status,
 	)
 	return scanMaterial(row)
 }
@@ -39,7 +39,7 @@ func (r *MaterialRepository) Create(m *models.Material) (*models.Material, error
 func (r *MaterialRepository) GetByID(id int64) (*models.Material, error) {
 	const q = `
 		SELECT id, isbn, title, author, publisher, edition, subject, grade_level,
-		       total_qty, available_qty, reserved_qty, status, created_at, updated_at, deleted_at
+		       total_qty, available_qty, reserved_qty, price, status, created_at, updated_at, deleted_at
 		FROM   materials
 		WHERE  id = ? AND deleted_at IS NULL`
 
@@ -65,6 +65,7 @@ func (r *MaterialRepository) Update(id int64, fields map[string]interface{}) err
 		"total_qty":     true,
 		"available_qty": true,
 		"reserved_qty":  true,
+		"price":         true,
 		"status":        true,
 	}
 
@@ -112,7 +113,7 @@ func (r *MaterialRepository) List(limit, offset int, filters map[string]string) 
 	}
 
 	q := `SELECT id, isbn, title, author, publisher, edition, subject, grade_level,
-		         total_qty, available_qty, reserved_qty, status, created_at, updated_at, deleted_at
+		         total_qty, available_qty, reserved_qty, price, status, created_at, updated_at, deleted_at
 		  FROM   materials
 		  WHERE  ` + strings.Join(where, " AND ") + `
 		  ORDER  BY id
@@ -141,7 +142,7 @@ func (r *MaterialRepository) List(limit, offset int, filters map[string]string) 
 func (r *MaterialRepository) Search(query string, limit, offset int) ([]models.Material, error) {
 	const q = `
 		SELECT m.id, m.isbn, m.title, m.author, m.publisher, m.edition, m.subject, m.grade_level,
-		       m.total_qty, m.available_qty, m.reserved_qty, m.status, m.created_at, m.updated_at, m.deleted_at
+		       m.total_qty, m.available_qty, m.reserved_qty, m.price, m.status, m.created_at, m.updated_at, m.deleted_at
 		FROM   materials_fts fts
 		JOIN   materials m ON m.id = fts.rowid
 		WHERE  materials_fts MATCH ? AND m.deleted_at IS NULL
@@ -190,16 +191,69 @@ func (r *MaterialRepository) Reserve(id int64, qty int) error {
 }
 
 // Release increments available_qty and decrements reserved_qty atomically.
+// This is the correct operation for pre-fulfillment cancellations (reserved →
+// available). It returns an error if reserved_qty would drop below zero,
+// preventing invariant violations from incorrect post-fulfillment calls.
 func (r *MaterialRepository) Release(id int64, qty int) error {
 	const q = `
 		UPDATE materials
 		SET    available_qty = available_qty + ?,
 		       reserved_qty  = reserved_qty  - ?,
 		       updated_at    = datetime('now')
+		WHERE  id = ? AND deleted_at IS NULL AND reserved_qty >= ?`
+
+	res, err := r.db.Exec(q, qty, qty, id, qty)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("repository: Release: insufficient reserved quantity for material %d (would go negative)", id)
+	}
+	return nil
+}
+
+// ReturnToStock increments available_qty only. Use this for post-fulfillment
+// returns where reserved_qty has already been decremented by the completion
+// transition. Calling Release after fulfillment would drive reserved_qty
+// negative; ReturnToStock is the correct post-fulfillment inventory operation.
+func (r *MaterialRepository) ReturnToStock(id int64, qty int) error {
+	const q = `
+		UPDATE materials
+		SET    available_qty = available_qty + ?,
+		       updated_at    = datetime('now')
 		WHERE  id = ? AND deleted_at IS NULL`
 
-	_, err := r.db.Exec(q, qty, qty, id)
+	_, err := r.db.Exec(q, qty, id)
 	return err
+}
+
+// DirectIssue decrements available_qty only — used when a copy is handed out
+// directly without a prior reservation step (e.g. the new leg of an exchange
+// on a completed order where the item is issued immediately, not queued).
+// Returns an error if available_qty would drop below zero.
+func (r *MaterialRepository) DirectIssue(id int64, qty int) error {
+	const q = `
+		UPDATE materials
+		SET    available_qty = available_qty - ?,
+		       updated_at    = datetime('now')
+		WHERE  id = ? AND deleted_at IS NULL AND available_qty >= ?`
+
+	res, err := r.db.Exec(q, qty, id, qty)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("repository: DirectIssue: insufficient available quantity for material %d", id)
+	}
+	return nil
 }
 
 // Fulfill decrements reserved_qty when items are actually issued.
@@ -247,7 +301,7 @@ func scanMaterial(s materialScanner) (*models.Material, error) {
 	err := s.Scan(
 		&m.ID, &m.ISBN, &m.Title, &m.Author, &m.Publisher, &m.Edition,
 		&m.Subject, &m.GradeLevel,
-		&m.TotalQty, &m.AvailableQty, &m.ReservedQty, &m.Status,
+		&m.TotalQty, &m.AvailableQty, &m.ReservedQty, &m.Price, &m.Status,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt,
 	)
 	if err != nil {
@@ -261,7 +315,7 @@ func scanMaterialRow(rows *sql.Rows) (*models.Material, error) {
 	err := rows.Scan(
 		&m.ID, &m.ISBN, &m.Title, &m.Author, &m.Publisher, &m.Edition,
 		&m.Subject, &m.GradeLevel,
-		&m.TotalQty, &m.AvailableQty, &m.ReservedQty, &m.Status,
+		&m.TotalQty, &m.AvailableQty, &m.ReservedQty, &m.Price, &m.Status,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt,
 	)
 	if err != nil {

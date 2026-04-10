@@ -38,7 +38,7 @@ func TestOrderRepository_Create_ReservesInventory(t *testing.T) {
 	userID, matID := orderFixtures(t, db, 10)
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 3, UnitPrice: 5.00},
+		{MaterialID: matID, Qty: 3},
 	}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
@@ -68,7 +68,7 @@ func TestOrderRepository_Create_RollsBackOnInsufficientStock(t *testing.T) {
 	userID, matID := orderFixtures(t, db, 2)
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 10, UnitPrice: 5.00},
+		{MaterialID: matID, Qty: 10},
 	}
 	_, err := orderRepo.Create(userID, items)
 	if err == nil {
@@ -80,7 +80,7 @@ func TestOrderRepository_Transition_ValidPath(t *testing.T) {
 	orderRepo, matRepo, db := newOrderRepo(t)
 	userID, matID := orderFixtures(t, db, 5)
 
-	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1, UnitPrice: 10.00}}
+	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1}}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -103,7 +103,7 @@ func TestOrderRepository_Transition_InvalidPath_Errors(t *testing.T) {
 	orderRepo, matRepo, db := newOrderRepo(t)
 	userID, matID := orderFixtures(t, db, 5)
 
-	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1, UnitPrice: 10.00}}
+	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1}}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -120,7 +120,7 @@ func TestOrderRepository_Transition_Cancel_ReleasesInventory(t *testing.T) {
 	orderRepo, matRepo, db := newOrderRepo(t)
 	userID, matID := orderFixtures(t, db, 5)
 
-	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 2, UnitPrice: 10.00}}
+	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 2}}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -143,7 +143,7 @@ func TestOrderRepository_CreateBackorder_And_Resolve(t *testing.T) {
 	orderRepo, _, db := newOrderRepo(t)
 	userID, matID := orderFixtures(t, db, 5)
 
-	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1, UnitPrice: 10.00}}
+	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1}}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -200,7 +200,7 @@ func TestOrderRepository_CreateReturnRequest(t *testing.T) {
 	orderRepo, _, db := newOrderRepo(t)
 	userID, matID := orderFixtures(t, db, 5)
 
-	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1, UnitPrice: 10.00}}
+	items := []repository.OrderItemInput{{MaterialID: matID, Qty: 1}}
 	order, err := orderRepo.Create(userID, items)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

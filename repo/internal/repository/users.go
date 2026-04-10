@@ -22,8 +22,11 @@ func NewUserRepository(db *sql.DB) *UserRepository {
 // userCols is the canonical ordered column list returned by every user SELECT.
 // All scan helpers must match this exact order.
 const userCols = `id, username, email, password_hash, role,
-	       failed_attempts, locked_until, date_of_birth, full_name, external_id,
-	       created_at, updated_at, deleted_at`
+	       failed_attempts, locked_until, date_of_birth,
+	       full_name, full_name_idx, full_name_phonetic,
+	       external_id, external_id_idx,
+	       created_at, updated_at, deleted_at,
+	       must_change_password`
 
 // Create inserts a new user and returns the populated model.
 func (r *UserRepository) Create(username, email, passwordHash, role string) (*models.User, error) {
@@ -128,21 +131,42 @@ func (r *UserRepository) Update(id int64, fields map[string]interface{}) error {
 	return err
 }
 
-// SetFullName sets the full_name field on a user record.
-// This is the primary name signal used for fuzzy duplicate-user detection.
-func (r *UserRepository) SetFullName(userID int64, fullName string) error {
-	const q = `UPDATE users SET full_name = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`
-	_, err := r.db.Exec(q, fullName, userID)
+// SetFullName stores the encrypted full_name, its HMAC blind index, and the
+// Soundex phonetic code derived from the plaintext name.
+// fullName is the AES-256-GCM ciphertext (enc: prefix + base64 blob).
+// fullNameIdx is the deterministic HMAC blind index for SQL equality matching.
+// phonetic is the American Soundex code used for fuzzy duplicate detection.
+func (r *UserRepository) SetFullName(userID int64, fullName, fullNameIdx, phonetic string) error {
+	const q = `UPDATE users SET full_name = ?, full_name_idx = ?, full_name_phonetic = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`
+	var idxVal interface{}
+	if fullNameIdx != "" {
+		idxVal = fullNameIdx
+	}
+	var phoneticVal interface{}
+	if phonetic != "" {
+		phoneticVal = phonetic
+	}
+	_, err := r.db.Exec(q, fullName, idxVal, phoneticVal, userID)
 	return err
 }
 
-// SetExternalID assigns the institution-issued external identifier (e.g. student
-// number, employee ID) to a user record.  external_id is the dedicated "exact ID"
-// signal in duplicate-user detection: two accounts sharing the same non-null
-// external_id are definitively the same person (score = 1.0).
-func (r *UserRepository) SetExternalID(userID int64, externalID string) error {
-	const q = `UPDATE users SET external_id = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`
-	_, err := r.db.Exec(q, externalID, userID)
+// SetExternalID stores the encrypted external_id and its HMAC blind index.
+// externalID is the encrypted ciphertext; externalIDIdx is the HMAC blind index.
+func (r *UserRepository) SetExternalID(userID int64, externalID, externalIDIdx string) error {
+	const q = `UPDATE users SET external_id = ?, external_id_idx = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`
+	var idxVal interface{}
+	if externalIDIdx != "" {
+		idxVal = externalIDIdx
+	}
+	_, err := r.db.Exec(q, externalID, idxVal, userID)
+	return err
+}
+
+// ClearMustChangePassword sets must_change_password = 0 for the given user
+// after they have successfully rotated their password.
+func (r *UserRepository) ClearMustChangePassword(userID int64) error {
+	const q = `UPDATE users SET must_change_password = 0, updated_at = datetime('now') WHERE id = ?`
+	_, err := r.db.Exec(q, userID)
 	return err
 }
 
@@ -167,8 +191,11 @@ func scanUser(s scanner) (*models.User, error) {
 	u := &models.User{}
 	err := s.Scan(
 		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role,
-		&u.FailedAttempts, &u.LockedUntil, &u.DateOfBirth, &u.FullName, &u.ExternalID,
+		&u.FailedAttempts, &u.LockedUntil, &u.DateOfBirth,
+		&u.FullName, &u.FullNameIdx, &u.FullNamePhonetic,
+		&u.ExternalID, &u.ExternalIDIdx,
 		&u.CreatedAt, &u.UpdatedAt, &u.DeletedAt,
+		&u.MustChangePassword,
 	)
 	if err != nil {
 		return nil, err
@@ -182,8 +209,11 @@ func scanUserRow(rows *sql.Rows) (*models.User, error) {
 	u := &models.User{}
 	err := rows.Scan(
 		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role,
-		&u.FailedAttempts, &u.LockedUntil, &u.DateOfBirth, &u.FullName, &u.ExternalID,
+		&u.FailedAttempts, &u.LockedUntil, &u.DateOfBirth,
+		&u.FullName, &u.FullNameIdx, &u.FullNamePhonetic,
+		&u.ExternalID, &u.ExternalIDIdx,
 		&u.CreatedAt, &u.UpdatedAt, &u.DeletedAt,
+		&u.MustChangePassword,
 	)
 	if err != nil {
 		return nil, err

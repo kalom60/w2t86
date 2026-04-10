@@ -14,6 +14,11 @@ import (
 // ErrShareExpired is returned when a share token exists but has passed its expiry time.
 var ErrShareExpired = errors.New("share link has expired")
 
+// ErrAlreadyRated is returned when a user attempts to rate a material they
+// have already rated.  Per-prompt rule: each textbook can be rated once per
+// student.
+var ErrAlreadyRated = errors.New("you have already rated this material")
+
 // EngagementRepository provides database operations for browse history, ratings,
 // comments, comment reports, and favorites lists/items.
 type EngagementRepository struct {
@@ -95,14 +100,21 @@ func (r *EngagementRepository) GetHistoryItems(userID int64, limit int) ([]model
 // Ratings
 // ---------------------------------------------------------------
 
-// UpsertRating inserts or updates the star rating for a material/user pair.
-func (r *EngagementRepository) UpsertRating(materialID, userID int64, stars int) error {
+// InsertRating records a star rating for a material/user pair exactly once.
+// Returns ErrAlreadyRated if the user has already rated this material.
+func (r *EngagementRepository) InsertRating(materialID, userID int64, stars int) error {
 	const q = `
-		INSERT INTO ratings (material_id, user_id, stars, created_at)
-		VALUES (?, ?, ?, datetime('now'))
-		ON CONFLICT(material_id, user_id) DO UPDATE SET stars = excluded.stars`
-	_, err := r.db.Exec(q, materialID, userID, stars)
-	return err
+		INSERT OR IGNORE INTO ratings (material_id, user_id, stars, created_at)
+		VALUES (?, ?, ?, datetime('now'))`
+	res, err := r.db.Exec(q, materialID, userID, stars)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAlreadyRated
+	}
+	return nil
 }
 
 // GetRating returns the rating a specific user gave to a material, or nil if none.
@@ -159,6 +171,11 @@ func (r *EngagementRepository) CreateComment(materialID, userID int64, body stri
 }
 
 // GetComments returns comments for a material, optionally including collapsed ones.
+// When includeCollapsed is false (non-moderator path), only comments with
+// status='visible' are returned.  Using an explicit allowlist rather than a
+// denylist (status != 'removed') ensures that collapsed comments are never
+// accidentally exposed to regular users regardless of what future statuses
+// may be added to the enum.
 func (r *EngagementRepository) GetComments(materialID int64, includeCollapsed bool, limit, offset int) ([]models.Comment, error) {
 	var q string
 	if includeCollapsed {
@@ -169,10 +186,12 @@ func (r *EngagementRepository) GetComments(materialID int64, includeCollapsed bo
 			ORDER  BY created_at DESC
 			LIMIT  ? OFFSET ?`
 	} else {
+		// Only surface publicly-visible comments.  Collapsed (pending moderator
+		// review) and removed comments must never be shown to regular users.
 		q = `
 			SELECT id, material_id, user_id, body, link_count, status, report_count, created_at, updated_at
 			FROM   comments
-			WHERE  material_id = ? AND status != 'removed'
+			WHERE  material_id = ? AND status = 'visible'
 			ORDER  BY created_at DESC
 			LIMIT  ? OFFSET ?`
 	}
@@ -235,10 +254,13 @@ func (r *EngagementRepository) ReportComment(commentID, reportedBy int64, reason
 }
 
 // CountRecentComments returns the number of comments a user has posted since the given time.
+// Uses UNIX epoch integers for comparison to avoid SQLite space-separator vs RFC3339 T-separator
+// format mismatch that would make the rate-limit check always pass.
 func (r *EngagementRepository) CountRecentComments(userID int64, since time.Time) (int, error) {
-	const q = `SELECT COUNT(*) FROM comments WHERE user_id = ? AND created_at >= ?`
+	const q = `SELECT COUNT(*) FROM comments WHERE user_id = ?
+		AND CAST(strftime('%s', created_at) AS INTEGER) >= ?`
 	var count int
-	err := r.db.QueryRow(q, userID, since.UTC().Format(time.RFC3339)).Scan(&count)
+	err := r.db.QueryRow(q, userID, since.UTC().Unix()).Scan(&count)
 	return count, err
 }
 

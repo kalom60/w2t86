@@ -37,21 +37,109 @@ func (s *AdminService) ListUsers(role string, limit, offset int) ([]models.User,
 
 // CreateUser registers a new user account.  fullName is the person's real
 // name used for duplicate detection; pass an empty string to leave it unset.
-func (s *AdminService) CreateUser(username, email, password, role, fullName string) (*models.User, error) {
+// encKey, if 32 bytes, encrypts fullName before storage.
+func (s *AdminService) CreateUser(username, email, password, role, fullName string, encKey []byte) (*models.User, error) {
 	authSvc := &AuthService{userRepo: s.userRepo}
 	user, err := authSvc.Register(username, email, password, role)
 	if err != nil {
 		return nil, fmt.Errorf("service: AdminService.CreateUser: %w", err)
 	}
 	if fullName != "" {
-		if err := s.userRepo.SetFullName(user.ID, fullName); err != nil {
+		stored, err := encryptSensitiveField(encKey, fullName)
+		if err != nil {
+			return nil, fmt.Errorf("service: AdminService.CreateUser: encrypt full_name: %w", err)
+		}
+		idx := crypto.BlindIndex(encKey, fullName)
+		phonetic := crypto.Soundex(fullName)
+		if err := s.userRepo.SetFullName(user.ID, stored, idx, phonetic); err != nil {
 			// Non-fatal: user was created; log and continue.
 			observability.App.Warn("set full_name failed", "user_id", user.ID, "error", err)
 		} else {
-			user.FullName = &fullName
+			user.FullName = &fullName // expose plaintext to caller
 		}
 	}
 	return user, nil
+}
+
+// SetUserFullName encrypts fullName and stores the value along with its HMAC
+// blind index.  encKey must be exactly 32 bytes; the call fails if it is not.
+func (s *AdminService) SetUserFullName(userID int64, fullName string, encKey []byte) error {
+	stored, err := encryptSensitiveField(encKey, fullName)
+	if err != nil {
+		return fmt.Errorf("service: AdminService.SetUserFullName: %w", err)
+	}
+	idx := crypto.BlindIndex(encKey, fullName)
+	phonetic := crypto.Soundex(fullName)
+	return s.userRepo.SetFullName(userID, stored, idx, phonetic)
+}
+
+// SetUserExternalID encrypts externalID and stores the value along with its HMAC
+// blind index.  encKey must be exactly 32 bytes; the call fails if it is not.
+func (s *AdminService) SetUserExternalID(userID int64, externalID string, encKey []byte) error {
+	stored, err := encryptSensitiveField(encKey, externalID)
+	if err != nil {
+		return fmt.Errorf("service: AdminService.SetUserExternalID: %w", err)
+	}
+	idx := crypto.BlindIndex(encKey, externalID)
+	return s.userRepo.SetExternalID(userID, stored, idx)
+}
+
+// DecryptUser decrypts the sensitive fields (full_name, external_id,
+// date_of_birth) on a copy of the user.  If a field is not encrypted (legacy
+// plaintext row) or decryption fails, the stored value is returned as-is.
+func (s *AdminService) DecryptUser(user *models.User, encKey []byte) *models.User {
+	if user == nil {
+		return nil
+	}
+	out := *user // shallow copy — only pointer fields differ
+	if user.FullName != nil {
+		plain := decryptSensitiveField(encKey, *user.FullName)
+		out.FullName = &plain
+	}
+	if user.ExternalID != nil {
+		plain := decryptSensitiveField(encKey, *user.ExternalID)
+		out.ExternalID = &plain
+	}
+	if user.DateOfBirth != nil {
+		plain := decryptSensitiveField(encKey, *user.DateOfBirth)
+		out.DateOfBirth = &plain
+	}
+	return &out
+}
+
+// encryptedPrefix is prepended to ciphertext so that legacy plaintext rows
+// can be distinguished from encrypted values without a separate flag column.
+const encryptedPrefix = "enc:"
+
+// encryptSensitiveField encrypts value with AES-256-GCM and prepends the
+// encryptedPrefix sentinel.  When encKey is absent or invalid the plaintext is
+// returned unchanged so that callers without a key still write readable data.
+func encryptSensitiveField(encKey []byte, value string) (string, error) {
+	if len(encKey) != 32 {
+		return "", fmt.Errorf("encryption key is missing or invalid (%d bytes); refusing plaintext write of sensitive field", len(encKey))
+	}
+	ct, err := crypto.EncryptField(encKey, value)
+	if err != nil {
+		return "", err
+	}
+	return encryptedPrefix + ct, nil
+}
+
+// decryptSensitiveField strips the encryptedPrefix and decrypts.  If the
+// value does not start with the prefix it is returned unchanged (legacy row).
+func decryptSensitiveField(encKey []byte, stored string) string {
+	if len(encKey) != 32 || !hasEncPrefix(stored) {
+		return stored
+	}
+	plain, err := crypto.DecryptField(encKey, stored[len(encryptedPrefix):])
+	if err != nil {
+		return stored // decryption failure: surface raw (shouldn't happen in prod)
+	}
+	return plain
+}
+
+func hasEncPrefix(s string) bool {
+	return len(s) > len(encryptedPrefix) && s[:len(encryptedPrefix)] == encryptedPrefix
 }
 
 // UpdateUserRole changes a user's role and writes an audit log entry.
@@ -80,12 +168,13 @@ func (s *AdminService) UnlockUser(userID int64, actorID int64) error {
 	return nil
 }
 
-// SetCustomField stores a custom field for a user.
+// SetCustomField stores a custom field for the given entity.
 // If encrypt is true the value is AES-256-GCM encrypted with encKey before
 // being stored; encKey must be exactly 32 bytes.  If encryption is requested
 // but the key is absent or the wrong length, the call fails rather than
 // silently falling back to plaintext storage.
-func (s *AdminService) SetCustomField(userID int64, name, value string, encrypt bool, encKey []byte) error {
+// actorID and reason are written to the immutable audit trail.
+func (s *AdminService) SetCustomField(entityType string, entityID int64, name, value string, encrypt bool, encKey []byte, actorID int64, reason string) error {
 	stored := value
 	if encrypt {
 		if len(encKey) != 32 {
@@ -97,14 +186,14 @@ func (s *AdminService) SetCustomField(userID int64, name, value string, encrypt 
 		}
 		stored = enc
 	}
-	return s.adminRepo.SetCustomField(userID, name, stored, encrypt)
+	return s.adminRepo.SetCustomField(entityType, entityID, name, stored, encrypt, actorID, reason)
 }
 
-// GetCustomFields returns all custom fields for a user.
+// GetCustomFields returns all custom fields for the given entity.
 // Encrypted fields have their FieldValue replaced with the plaintext if encKey
 // is provided and 32 bytes; otherwise the raw (ciphertext) value is returned.
-func (s *AdminService) GetCustomFields(userID int64, encKey []byte) ([]models.UserCustomField, error) {
-	fields, err := s.adminRepo.GetCustomFields(userID)
+func (s *AdminService) GetCustomFields(entityType string, entityID int64, encKey []byte) ([]models.EntityCustomField, error) {
+	fields, err := s.adminRepo.GetCustomFields(entityType, entityID)
 	if err != nil {
 		return nil, err
 	}
@@ -122,9 +211,22 @@ func (s *AdminService) GetCustomFields(userID int64, encKey []byte) ([]models.Us
 	return fields, nil
 }
 
-// DeleteCustomField removes a custom field for a user.
-func (s *AdminService) DeleteCustomField(userID int64, name string) error {
-	return s.adminRepo.DeleteCustomField(userID, name)
+// DeleteCustomField removes a custom field for the given entity.
+// actorID and reason are written to the immutable audit trail.
+func (s *AdminService) DeleteCustomField(entityType string, entityID int64, name string, actorID int64, reason string) error {
+	return s.adminRepo.DeleteCustomField(entityType, entityID, name, actorID, reason)
+}
+
+// GetCustomFieldAuditLog returns the immutable audit trail for a specific entity's custom fields.
+func (s *AdminService) GetCustomFieldAuditLog(entityType string, entityID int64) ([]models.EntityCustomFieldAudit, error) {
+	return s.adminRepo.GetCustomFieldAuditLog(entityType, entityID)
+}
+
+// GetEntityDisplayName returns a human-readable label for the entity
+// (e.g. the user's username, a material's title, a course name).
+// Never returns an error; falls back to "<type> #<id>" for unknown rows.
+func (s *AdminService) GetEntityDisplayName(entityType string, entityID int64) string {
+	return s.adminRepo.GetEntityDisplayName(entityType, entityID)
 }
 
 // ---------------------------------------------------------------

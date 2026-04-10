@@ -1,0 +1,43 @@
+<div class="card mb-4">
+  <div class="card-body">
+    <h5 class="card-title">Create New List</h5>
+    {{if .Error}}
+    <div class="alert alert-danger py-2 mb-3" role="alert">{{.Error}}</div>
+    {{end}}
+    <form
+      id="create-list-form"
+      hx-post="/favorites"
+      hx-target="#favorites-lists"
+      hx-swap="outerHTML"
+      hx-on::after-request="this.reset()">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-5">
+          <label class="form-label" for="list-name">List Name</label>
+          <input
+            class="form-control"
+            type="text"
+            id="list-name"
+            name="name"
+            placeholder="e.g. My Science Books"
+            maxlength="100"
+            required>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label" for="list-visibility">Visibility</label>
+          <select class="form-select" id="list-visibility" name="visibility">
+            <option value="private">Private</option>
+            <option value="public">Public</option>
+          </select>
+        </div>
+        <div class="col-md-auto">
+          <button class="btn btn-primary" type="submit"
+            hx-on::before-request="this.disabled=true"
+            hx-on::after-request="this.disabled=false">
+            <span class="spinner-border spinner-border-sm htmx-indicator me-1" role="status"></span>
+            <i class="bi bi-plus-lg me-1"></i>Create
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>

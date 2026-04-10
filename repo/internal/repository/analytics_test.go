@@ -11,6 +11,105 @@ import (
 	"w2t86/internal/testutil"
 )
 
+// TestRegionStats_CorrectAggregation verifies that RegionStats produces
+// per-region counts that correctly reflect only events whose custody names
+// match nearby locations, not a cross-join total.
+//
+// Setup:
+//   - Region A at (0.0, 0.0)  — depot "Depot-A" at (0.1, 0.1) is within 50 km
+//   - Region B at (10.0, 10.0) — depot "Depot-B" at (10.1, 10.1) is within 50 km
+//   - 2 distribution events referencing Depot-A (custody_to = "Depot-A")
+//   - 1 distribution event referencing Depot-B
+//
+// Expected: region A = 2 scans, region B = 1 scan; no cross-contamination.
+func TestRegionStats_CorrectAggregation(t *testing.T) {
+	db := testutil.NewTestDB(t)
+
+	// Insert region centroids.
+	if _, err := db.Exec(`INSERT INTO locations (name, type, lat, lng) VALUES ('Region-A', 'admin_region', 0.0, 0.0)`); err != nil {
+		t.Fatalf("insert Region-A: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO locations (name, type, lat, lng) VALUES ('Region-B', 'admin_region', 10.0, 10.0)`); err != nil {
+		t.Fatalf("insert Region-B: %v", err)
+	}
+	// Insert depot locations (non-region, within 50 km of their respective regions).
+	if _, err := db.Exec(`INSERT INTO locations (name, type, lat, lng) VALUES ('Depot-A', 'depot', 0.1, 0.1)`); err != nil {
+		t.Fatalf("insert Depot-A: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO locations (name, type, lat, lng) VALUES ('Depot-B', 'depot', 10.1, 10.1)`); err != nil {
+		t.Fatalf("insert Depot-B: %v", err)
+	}
+
+	// Insert a material and two orders.
+	var matID, orderID1, orderID2 int64
+	if err := db.QueryRow(`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status) VALUES ('Book', 10, 10, 0, 'active') RETURNING id`).Scan(&matID); err != nil {
+		t.Fatalf("insert material: %v", err)
+	}
+	var userID int64
+	if err := db.QueryRow(`INSERT INTO users (username, email, password_hash, role) VALUES ('u1','u1@x.com','$2a$12$x','student') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if err := db.QueryRow(`INSERT INTO orders (user_id, status, total_amount, auto_close_at, created_at, updated_at) VALUES (?, 'completed', 0, datetime('now'), datetime('now'), datetime('now')) RETURNING id`, userID).Scan(&orderID1); err != nil {
+		t.Fatalf("insert order1: %v", err)
+	}
+	if err := db.QueryRow(`INSERT INTO orders (user_id, status, total_amount, auto_close_at, created_at, updated_at) VALUES (?, 'completed', 0, datetime('now'), datetime('now'), datetime('now')) RETURNING id`, userID).Scan(&orderID2); err != nil {
+		t.Fatalf("insert order2: %v", err)
+	}
+
+	// 2 events for Region-A depot, 1 event for Region-B depot.
+	insEvent := func(orderID int64, custodyTo string) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO distribution_events (order_id, material_id, qty, event_type, actor_id, custody_to, occurred_at) VALUES (?, ?, 1, 'issue', ?, ?, datetime('now'))`, orderID, matID, userID, custodyTo); err != nil {
+			t.Fatalf("insert event custody_to=%s: %v", custodyTo, err)
+		}
+	}
+	insEvent(orderID1, "Depot-A")
+	insEvent(orderID1, "Depot-A") // second event same order
+	insEvent(orderID2, "Depot-B")
+
+	repo := repository.NewAnalyticsRepository(db)
+	stats, err := repo.RegionStats()
+	if err != nil {
+		t.Fatalf("RegionStats: %v", err)
+	}
+
+	byName := make(map[string]struct {
+		orders, scans int
+	})
+	for _, s := range stats {
+		byName[s.RegionName] = struct{ orders, scans int }{s.OrderCount, s.ScanCount}
+	}
+
+	// Region A should have 2 scans from 1 distinct order.
+	if a, ok := byName["Region-A"]; !ok {
+		t.Fatal("Region-A not found in stats")
+	} else {
+		if a.scans != 2 {
+			t.Errorf("Region-A: expected 2 scans, got %d", a.scans)
+		}
+		if a.orders != 1 {
+			t.Errorf("Region-A: expected 1 order, got %d", a.orders)
+		}
+	}
+
+	// Region B should have 1 scan from 1 distinct order.
+	if b, ok := byName["Region-B"]; !ok {
+		t.Fatal("Region-B not found in stats")
+	} else {
+		if b.scans != 1 {
+			t.Errorf("Region-B: expected 1 scan, got %d", b.scans)
+		}
+		if b.orders != 1 {
+			t.Errorf("Region-B: expected 1 order, got %d", b.orders)
+		}
+	}
+
+	// Crucially: Region A must NOT have Region B's counts (no cross-join).
+	if a, b := byName["Region-A"], byName["Region-B"]; a.scans == a.scans+b.scans {
+		t.Errorf("cross-join detected: Region-A scan count (%d) equals total (%d)", a.scans, a.scans+b.scans)
+	}
+}
+
 // TestSpatialAggregates_Query_Under200ms verifies the checklist requirement:
 // "Spatial aggregate query returns in <200ms on 10k rows."
 //

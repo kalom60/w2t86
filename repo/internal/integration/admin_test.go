@@ -134,8 +134,7 @@ func TestUnlockUser(t *testing.T) {
 	}
 }
 
-// TestDuplicatesPage verifies GET /admin/duplicates for an admin returns a
-// non-auth-error status.
+// TestDuplicatesPage verifies GET /admin/duplicates for an admin returns 200.
 func TestDuplicatesPage(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()
@@ -143,16 +142,12 @@ func TestDuplicatesPage(t *testing.T) {
 	adminCookie := loginAs(t, app, db, "admin")
 
 	resp := makeRequest(app, http.MethodGet, "/admin/duplicates", "", adminCookie, "")
-	if resp.StatusCode == http.StatusForbidden {
-		t.Fatal("expected non-403 for admin on /admin/duplicates")
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		t.Fatal("expected non-401 for admin on /admin/duplicates")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for admin on /admin/duplicates, got %d", resp.StatusCode)
 	}
 }
 
-// TestAuditLog verifies GET /admin/audit for an admin returns a non-auth-error
-// status.
+// TestAuditLog verifies GET /admin/audit for an admin returns 200.
 func TestAuditLog(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()
@@ -160,11 +155,8 @@ func TestAuditLog(t *testing.T) {
 	adminCookie := loginAs(t, app, db, "admin")
 
 	resp := makeRequest(app, http.MethodGet, "/admin/audit", "", adminCookie, "")
-	if resp.StatusCode == http.StatusForbidden {
-		t.Fatal("expected non-403 for admin on /admin/audit")
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		t.Fatal("expected non-401 for admin on /admin/audit")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for admin on /admin/audit, got %d", resp.StatusCode)
 	}
 }
 

@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"bufio"
+	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
 
 	"w2t86/internal/middleware"
 	"w2t86/internal/observability"
@@ -14,11 +18,17 @@ import (
 // DND settings, and subscription pages.
 type MessagingHandler struct {
 	msgService *services.MessagingService
+	timezone   string // IANA timezone name shown in the DND settings UI
 }
 
 // NewMessagingHandler creates a MessagingHandler backed by the given service.
-func NewMessagingHandler(ms *services.MessagingService) *MessagingHandler {
-	return &MessagingHandler{msgService: ms}
+// timezone is the IANA name (e.g. "UTC", "America/New_York") that DND hours
+// are evaluated in; pass "" to default to "UTC".
+func NewMessagingHandler(ms *services.MessagingService, timezone string) *MessagingHandler {
+	if timezone == "" {
+		timezone = "UTC"
+	}
+	return &MessagingHandler{msgService: ms, timezone: timezone}
 }
 
 // ---------------------------------------------------------------
@@ -77,6 +87,53 @@ func (h *MessagingHandler) InboxItems(c *fiber.Ctx) error {
 		"Notifications": notifications,
 		"User":          user,
 	})
+}
+
+// InboxSSE handles GET /inbox/sse — streams Server-Sent Events to the client.
+// Each time the user's unread count changes, an "inbox-update" event is pushed
+// so the inbox page refreshes immediately without polling.  The stream runs
+// until the client disconnects.
+func (h *MessagingHandler) InboxSSE(c *fiber.Ctx) error {
+	user := middleware.GetUser(c)
+	userID := user.ID
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+	c.Set("Transfer-Encoding", "chunked")
+	c.Set("X-Accel-Buffering", "no") // disable nginx proxy buffering
+
+	c.Context().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
+		lastCount := -1
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		// Push an initial event immediately so the page is up-to-date on connect.
+		if count, err := h.msgService.CountUnread(userID); err == nil {
+			lastCount = count
+			fmt.Fprintf(w, "event: inbox-update\ndata: %d\n\n", count)
+			if err := w.Flush(); err != nil {
+				return
+			}
+		}
+
+		for range ticker.C {
+			count, err := h.msgService.CountUnread(userID)
+			if err != nil {
+				observability.App.Warn("SSE: count unread failed", "user_id", userID, "error", err)
+				return
+			}
+			if count != lastCount {
+				lastCount = count
+				fmt.Fprintf(w, "event: inbox-update\ndata: %d\n\n", count)
+				if err := w.Flush(); err != nil {
+					// Client disconnected.
+					return
+				}
+			}
+		}
+	}))
+	return nil
 }
 
 // MarkRead handles POST /inbox/:id/read — marks a single notification as read.
@@ -161,6 +218,7 @@ func (h *MessagingHandler) Settings(c *fiber.Ctx) error {
 		"DND":        dnd,
 		"SubMap":     subMap,
 		"Topics":     topics,
+		"Timezone":   h.timezone,
 		"ActivePage": "inbox",
 	}, "layouts/base")
 }

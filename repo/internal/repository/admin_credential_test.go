@@ -1,115 +1,91 @@
 package repository_test
 
-// admin_credential_test.go — programmatic proof that the seeded admin bcrypt
-// hash resolves to the documented plaintext password "ChangeMe123!".
+// admin_credential_test.go — programmatic proof that the seeded admin account
+// uses a non-functional bootstrap placeholder (not a known exploitable password)
+// and that the server's auto-rotation mechanism produces a working bcrypt hash.
 //
-// This test closes audit Issue #5 by using golang.org/x/crypto/bcrypt directly
-// (not through any application wrapper) to verify the credential stored in
-// migrations/001_schema.sql.  A static auditor can inspect this file and the
-// migration, run `go test`, and obtain deterministic, repeatable proof that the
-// default login works — without manual runtime interaction.
+// The old approach seeded a known bcrypt hash for "ChangeMe123!" directly in the
+// migration, creating an exploitable window between deployment and first login.
+// The new approach seeds the sentinel string "BOOTSTRAP_PENDING_ROTATION" which
+// is NOT a valid bcrypt hash.  On first boot, cmd/server/main.go detects this
+// sentinel, generates a random password, hashes it, and logs it once.
 
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
-	"golang.org/x/crypto/bcrypt"
+	"w2t86/internal/crypto"
 )
 
 // schemaFilePath returns the absolute path to migrations/001_schema.sql by
-// navigating upward from this source file's location, so the test works
-// regardless of the working directory passed to `go test`.
+// navigating upward from this source file's location.
 func schemaFilePath(t *testing.T) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller(0) failed — cannot determine source file location")
 	}
-	// thisFile: …/internal/repository/admin_credential_test.go
-	// root:     …/  (two levels up)
 	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	return filepath.Join(root, "migrations", "001_schema.sql")
 }
 
-// extractAdminHash reads migrations/001_schema.sql and returns the bcrypt hash
-// from the admin seed INSERT statement.
-func extractAdminHash(t *testing.T) string {
-	t.Helper()
+// TestAdminSeed_UsesBootstrapPlaceholder verifies that the migration file does
+// NOT contain a known exploitable bcrypt hash for the admin account.
+// The seeded value must be the sentinel "BOOTSTRAP_PENDING_ROTATION" so that
+// login is impossible until the server performs the auto-rotation on first boot.
+func TestAdminSeed_UsesBootstrapPlaceholder(t *testing.T) {
 	data, err := os.ReadFile(schemaFilePath(t))
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
 	}
-	// Match the bcrypt hash (3rd positional value) in the admin seed INSERT,
-	// regardless of how many additional columns follow it.
-	re := regexp.MustCompile(`VALUES\s*\(\s*'admin'\s*,\s*'[^']+'\s*,\s*'(\$2[aby]\$[^']+)'\s*,`)
-	m := re.FindStringSubmatch(string(data))
-	if len(m) < 2 {
-		t.Fatalf("admin seed INSERT not found in %s — regex did not match", schemaFilePath(t))
+	content := string(data)
+
+	const placeholder = "BOOTSTRAP_PENDING_ROTATION"
+	if !strings.Contains(content, placeholder) {
+		t.Errorf("migrations/001_schema.sql must contain the bootstrap placeholder %q — found none\n"+
+			"This means a known credential is seeded, which is a security risk.", placeholder)
 	}
-	return strings.TrimSpace(m[1])
 }
 
-// TestAdminSeedHash_BcryptMatchesDocumentedPassword is the definitive
-// programmatic proof for audit Issue #5.
-//
-// It calls golang.org/x/crypto/bcrypt.CompareHashAndPassword directly against
-// the hash string embedded in the migration file.  No application wrapper is
-// used, so the result is unambiguous: if this test passes, the credential is
-// cryptographically valid and the default admin login WILL work on a freshly
-// initialised database.
-func TestAdminSeedHash_BcryptMatchesDocumentedPassword(t *testing.T) {
-	const documentedPassword = "ChangeMe123!"
-
-	seedHash := extractAdminHash(t)
-	t.Logf("seed hash from 001_schema.sql: %s", seedHash)
-
-	// Direct bcrypt verification — no application wrapper.
-	err := bcrypt.CompareHashAndPassword([]byte(seedHash), []byte(documentedPassword))
+// TestAdminSeed_NoKnownBcryptHash verifies that the migration does NOT contain
+// a known exploitable bcrypt hash (the old "ChangeMe123!" hash or any other
+// well-known hash that would let an attacker log in before auto-rotation).
+func TestAdminSeed_NoKnownBcryptHash(t *testing.T) {
+	data, err := os.ReadFile(schemaFilePath(t))
 	if err != nil {
-		t.Errorf("bcrypt.CompareHashAndPassword returned %v\n"+
-			"seed hash:  %s\n"+
-			"password:   %s\n"+
-			"The documented default password does not match the seeded hash.\n"+
-			"Fix: regenerate the hash with bcrypt cost 12 and update\n"+
-			"     migrations/001_schema.sql and README.md.",
-			err, seedHash, documentedPassword)
+		t.Fatalf("read schema: %v", err)
+	}
+	content := string(data)
+
+	// The well-known legacy hash for "ChangeMe123!" must no longer appear in the
+	// migration source.
+	const legacyHash = "$2a$12$fMPISK6tAC1XLVM3JdJQDuB/CrXgdRM.LUPHHu4/VxS/vzihnYyQ."
+	if strings.Contains(content, legacyHash) {
+		t.Errorf("migrations/001_schema.sql still contains the legacy known-default bcrypt hash.\n"+
+			"Replace it with the bootstrap placeholder %q.", "BOOTSTRAP_PENDING_ROTATION")
 	}
 }
 
-// TestAdminSeedHash_WrongPasswordRejected confirms that bcrypt does NOT accept
-// common near-miss variants, ruling out a weak or trivially bypassed hash.
-func TestAdminSeedHash_WrongPasswordRejected(t *testing.T) {
-	seedHash := extractAdminHash(t)
-
-	variants := []string{
-		"changeme123!",  // wrong case
-		"ChangeMe123",   // missing !
-		"ChangeMe123!!",  // extra !
-		"ChangeMe123! ", // trailing space
-		"",             // empty
-	}
-	for _, bad := range variants {
-		err := bcrypt.CompareHashAndPassword([]byte(seedHash), []byte(bad))
-		if err == nil {
-			t.Errorf("bcrypt.CompareHashAndPassword unexpectedly accepted %q — hash may be too weak", bad)
-		}
-	}
-}
-
-// TestAdminSeedHash_IsBcryptCost12 verifies the hash was generated at the
-// required minimum cost of 12 (as enforced by the AuthService).
-func TestAdminSeedHash_IsBcryptCost12(t *testing.T) {
-	seedHash := extractAdminHash(t)
-	cost, err := bcrypt.Cost([]byte(seedHash))
+// TestAutoRotation_ProducesWorkingHash verifies that the bootstrap rotation
+// logic (GenerateRandomPassword + HashPassword + CheckPassword) produces a
+// valid, usable bcrypt credential — i.e., the round-trip works correctly.
+func TestAutoRotation_ProducesWorkingHash(t *testing.T) {
+	pass, err := crypto.GenerateRandomPassword()
 	if err != nil {
-		t.Fatalf("bcrypt.Cost: %v", err)
+		t.Fatalf("GenerateRandomPassword: %v", err)
 	}
-	if cost < 12 {
-		t.Errorf("seed hash bcrypt cost = %d, want >= 12", cost)
+	if len(pass) < 16 {
+		t.Errorf("generated password too short: %d chars", len(pass))
 	}
-	t.Logf("bcrypt cost: %d", cost)
+
+	hash, err := crypto.HashPassword(pass)
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if !crypto.CheckPassword(hash, pass) {
+		t.Error("CheckPassword returned false for a freshly generated password — rotation would produce an unusable credential")
+	}
 }

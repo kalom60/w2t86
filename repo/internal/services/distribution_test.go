@@ -79,12 +79,22 @@ func TestDistributionService_RecordReturn_ReleasesInventory(t *testing.T) {
 	svc, db := newDistributionService(t)
 	userID, matID, orderID := distSvcFixtures(t, db)
 
+	// Create an approved return request.
+	var rrID int64
+	if err := db.QueryRow(
+		`INSERT INTO return_requests (order_id, user_id, type, status, requested_at)
+		 VALUES (?, ?, 'return', 'approved', datetime('now')) RETURNING id`,
+		orderID, userID,
+	).Scan(&rrID); err != nil {
+		t.Fatalf("insert return_request: %v", err)
+	}
+
 	var beforeAvail int
 	if err := db.QueryRow(`SELECT available_qty FROM materials WHERE id = ?`, matID).Scan(&beforeAvail); err != nil {
 		t.Fatalf("query before: %v", err)
 	}
 
-	if err := svc.RecordReturn(orderID, matID, userID, "SCAN200", 1); err != nil {
+	if err := svc.RecordReturn(orderID, matID, userID, rrID, "SCAN200", 1); err != nil {
 		t.Fatalf("RecordReturn: %v", err)
 	}
 
@@ -101,18 +111,28 @@ func TestDistributionService_RecordExchange_Success(t *testing.T) {
 	svc, db := newDistributionService(t)
 	userID, oldMatID, orderID := distSvcFixtures(t, db)
 
-	// Insert a new material to exchange into
+	// Insert a new material to exchange into.
 	r, err := db.Exec(`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status) VALUES ('New Book', 5, 5, 0, 'active')`)
 	if err != nil {
 		t.Fatalf("insert new material: %v", err)
 	}
 	newMatID, _ := r.LastInsertId()
 
-	if err := svc.RecordExchange(orderID, oldMatID, newMatID, userID, "SCAN300", 1); err != nil {
+	// Create an approved exchange request.
+	var rrID int64
+	if err := db.QueryRow(
+		`INSERT INTO return_requests (order_id, user_id, type, status, requested_at)
+		 VALUES (?, ?, 'exchange', 'approved', datetime('now')) RETURNING id`,
+		orderID, userID,
+	).Scan(&rrID); err != nil {
+		t.Fatalf("insert return_request: %v", err)
+	}
+
+	if err := svc.RecordExchange(orderID, oldMatID, newMatID, userID, rrID, "SCAN300", 1); err != nil {
 		t.Fatalf("RecordExchange: %v", err)
 	}
 
-	// New material available_qty should decrease by 1
+	// New material available_qty should decrease by 1.
 	var newAvail int
 	if err := db.QueryRow(`SELECT available_qty FROM materials WHERE id = ?`, newMatID).Scan(&newAvail); err != nil {
 		t.Fatalf("query new material: %v", err)
@@ -126,17 +146,46 @@ func TestDistributionService_ReissueItem_Success(t *testing.T) {
 	svc, db := newDistributionService(t)
 	userID, matID, orderID := distSvcFixtures(t, db)
 
+	var beforeAvail int
+	if err := db.QueryRow(`SELECT available_qty FROM materials WHERE id = ?`, matID).Scan(&beforeAvail); err != nil {
+		t.Fatalf("query before available_qty: %v", err)
+	}
+
 	if err := svc.ReissueItem(orderID, matID, userID, "OLD_SCAN", "NEW_SCAN", "lost"); err != nil {
 		t.Fatalf("ReissueItem (lost): %v", err)
 	}
 
-	// Check two events were created
+	// Two events must be recorded: one "lost" event and one "issued" event.
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM distribution_events WHERE order_id = ?`, orderID).Scan(&count); err != nil {
 		t.Fatalf("count events: %v", err)
 	}
 	if count < 2 {
 		t.Errorf("expected at least 2 distribution events, got %d", count)
+	}
+
+	// Inventory must be decremented by 1 for the replacement copy.
+	var afterAvail int
+	if err := db.QueryRow(`SELECT available_qty FROM materials WHERE id = ?`, matID).Scan(&afterAvail); err != nil {
+		t.Fatalf("query after available_qty: %v", err)
+	}
+	if afterAvail != beforeAvail-1 {
+		t.Errorf("expected available_qty=%d after reissue, got %d (inventory not decremented)", beforeAvail-1, afterAvail)
+	}
+}
+
+func TestDistributionService_ReissueItem_ZeroStock_Fails(t *testing.T) {
+	svc, db := newDistributionService(t)
+	userID, matID, orderID := distSvcFixtures(t, db)
+
+	// Drive available_qty to zero.
+	if _, err := db.Exec(`UPDATE materials SET available_qty = 0 WHERE id = ?`, matID); err != nil {
+		t.Fatalf("set available_qty=0: %v", err)
+	}
+
+	err := svc.ReissueItem(orderID, matID, userID, "OLD2", "NEW2", "damaged")
+	if err == nil {
+		t.Error("expected error when available_qty=0, got nil")
 	}
 }
 
@@ -227,5 +276,94 @@ func TestIssueItems_FullFulfillment_MarksItemFulfilled(t *testing.T) {
 	}
 	if backorderCount != 0 {
 		t.Errorf("expected 0 backorders for full fulfillment, got %d", backorderCount)
+	}
+}
+
+// TestDistributionService_RecordReturn_MaterialNotInOrder verifies that
+// RecordReturn rejects a materialID that is not part of the order's line items.
+func TestDistributionService_RecordReturn_MaterialNotInOrder(t *testing.T) {
+	svc, db := newDistributionService(t)
+	userID, _, orderID := distSvcFixtures(t, db)
+
+	// Insert a second material that is NOT part of the order.
+	r, err := db.Exec(`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status) VALUES ('Unrelated Book', 5, 5, 0, 'active')`)
+	if err != nil {
+		t.Fatalf("insert unrelated material: %v", err)
+	}
+	unrelatedMatID, _ := r.LastInsertId()
+
+	// Create an approved return request.
+	var rrID int64
+	if err := db.QueryRow(
+		`INSERT INTO return_requests (order_id, user_id, type, status, requested_at)
+		 VALUES (?, ?, 'return', 'approved', datetime('now')) RETURNING id`,
+		orderID, userID,
+	).Scan(&rrID); err != nil {
+		t.Fatalf("insert return_request: %v", err)
+	}
+
+	// Attempt to return the unrelated material — must fail.
+	err = svc.RecordReturn(orderID, unrelatedMatID, userID, rrID, "SCAN_UNRELATED", 1)
+	if err == nil {
+		t.Error("expected error when materialID is not part of order, got nil")
+	}
+}
+
+// TestDistributionService_RecordReturn_OverReturn verifies that RecordReturn
+// rejects a return quantity that exceeds the originally ordered quantity.
+func TestDistributionService_RecordReturn_OverReturn(t *testing.T) {
+	svc, db := newDistributionService(t)
+	userID, matID, orderID := distSvcFixtures(t, db)
+
+	// Create an approved return request.
+	var rrID int64
+	if err := db.QueryRow(
+		`INSERT INTO return_requests (order_id, user_id, type, status, requested_at)
+		 VALUES (?, ?, 'return', 'approved', datetime('now')) RETURNING id`,
+		orderID, userID,
+	).Scan(&rrID); err != nil {
+		t.Fatalf("insert return_request: %v", err)
+	}
+
+	// The fixture inserts qty=2 in order_items; returning 999 must fail.
+	err := svc.RecordReturn(orderID, matID, userID, rrID, "SCAN_OVER", 999)
+	if err == nil {
+		t.Error("expected error when return qty exceeds ordered qty, got nil")
+	}
+}
+
+// TestDistributionService_RecordExchange_OldMaterialNotInOrder verifies that
+// RecordExchange rejects an oldMaterialID not present in the order's line items.
+func TestDistributionService_RecordExchange_OldMaterialNotInOrder(t *testing.T) {
+	svc, db := newDistributionService(t)
+	userID, _, orderID := distSvcFixtures(t, db)
+
+	// Insert materials: one unrelated (old) and one valid (new).
+	r, err := db.Exec(`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status) VALUES ('Unrelated Old', 5, 5, 0, 'active')`)
+	if err != nil {
+		t.Fatalf("insert unrelated material: %v", err)
+	}
+	unrelatedOldID, _ := r.LastInsertId()
+
+	r2, err := db.Exec(`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status) VALUES ('New Book', 5, 5, 0, 'active')`)
+	if err != nil {
+		t.Fatalf("insert new material: %v", err)
+	}
+	newMatID, _ := r2.LastInsertId()
+
+	// Create an approved exchange request.
+	var rrID int64
+	if err := db.QueryRow(
+		`INSERT INTO return_requests (order_id, user_id, type, status, requested_at)
+		 VALUES (?, ?, 'exchange', 'approved', datetime('now')) RETURNING id`,
+		orderID, userID,
+	).Scan(&rrID); err != nil {
+		t.Fatalf("insert return_request: %v", err)
+	}
+
+	// oldMaterialID is not part of the order — must fail.
+	err = svc.RecordExchange(orderID, unrelatedOldID, newMatID, userID, rrID, "SCAN_EXCH", 1)
+	if err == nil {
+		t.Error("expected error when oldMaterialID is not part of order, got nil")
 	}
 }

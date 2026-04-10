@@ -10,9 +10,9 @@
 ================================================================ -->
 <div class="card mb-4">
   <div class="card-header fw-semibold d-flex align-items-center gap-2">
-    <i class="bi bi-moon-stars me-1"></i> Do-Not-Disturb (UTC)
+    <i class="bi bi-moon-stars me-1"></i> Do-Not-Disturb ({{.Timezone}})
     {{if .DND}}
-    <span class="badge bg-warning text-dark ms-auto">Active: {{.DND.StartHour}}:00 &ndash; {{.DND.EndHour}}:00 UTC</span>
+    <span class="badge bg-warning text-dark ms-auto">Active: {{.DND.StartHour}}:00 &ndash; {{.DND.EndHour}}:00 {{.Timezone}}</span>
     {{else}}
     <span class="badge bg-secondary ms-auto">Not configured</span>
     {{end}}
@@ -21,7 +21,7 @@
 
     {{if .DND}}
     <p class="small text-muted mb-3">
-      Currently set: <strong>{{.DND.StartHour}}:00</strong> &ndash; <strong>{{.DND.EndHour}}:00</strong> UTC
+      Currently set: <strong>{{.DND.StartHour}}:00</strong> &ndash; <strong>{{.DND.EndHour}}:00</strong> {{.Timezone}}
     </p>
     {{else}}
     <p class="small text-muted mb-3">No DND window configured.</p>
@@ -36,7 +36,7 @@
 
       <div class="row g-3 align-items-end mb-3">
         <div class="col-auto">
-          <label class="form-label" for="start_hour">Start Hour</label>
+          <label class="form-label" for="start_hour">Start Hour <span class="text-muted small">({{.Timezone}})</span></label>
           <select class="form-select form-select-sm w-auto d-inline" id="start_hour" name="start_hour">
             {{range $h := hourRange}}
             <option value="{{$h.Val}}"
@@ -48,7 +48,7 @@
         </div>
 
         <div class="col-auto">
-          <label class="form-label" for="end_hour">End Hour</label>
+          <label class="form-label" for="end_hour">End Hour <span class="text-muted small">({{.Timezone}})</span></label>
           <select class="form-select form-select-sm w-auto d-inline" id="end_hour" name="end_hour">
             {{range $h := hourRange}}
             <option value="{{$h.Val}}"
@@ -61,6 +61,7 @@
       </div>
 
       <p class="form-text text-muted mb-3">
+        All hours are in <strong>{{.Timezone}}</strong> (server timezone, set via <code>TIMEZONE</code> env).
         Notifications received during this window will be held and delivered when the window ends.
         Set start = end to disable DND.
       </p>

@@ -272,7 +272,7 @@ func TestRating_Stars6_Fails(t *testing.T) {
 	}
 }
 
-func TestRating_SameUser_SecondRating_Updates(t *testing.T) {
+func TestRating_SameUser_SecondRating_Rejected(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	svc := newMaterialService(t, db, nil)
 	matID := seedMaterialForValidation(t, db)
@@ -281,18 +281,19 @@ func TestRating_SameUser_SecondRating_Updates(t *testing.T) {
 	if err := svc.Rate(matID, userID, 3); err != nil {
 		t.Fatalf("first rating: %v", err)
 	}
-	// Second rating — should be an upsert, not a duplicate error.
-	if err := svc.Rate(matID, userID, 5); err != nil {
-		t.Errorf("expected second rating to upsert, got: %v", err)
+	// Second rating — must be rejected per "rate once" business rule.
+	err := svc.Rate(matID, userID, 5)
+	if err == nil {
+		t.Error("expected error for second rating, got nil")
 	}
 
-	// Verify the stored value is the updated one.
-	stars, err := svc.GetUserRating(matID, userID)
-	if err != nil {
-		t.Fatalf("GetUserRating: %v", err)
+	// Verify the stored value is the original, unmodified rating.
+	stars, starsErr := svc.GetUserRating(matID, userID)
+	if starsErr != nil {
+		t.Fatalf("GetUserRating: %v", starsErr)
 	}
-	if stars != 5 {
-		t.Errorf("expected stars=5 after update, got %d", stars)
+	if stars != 3 {
+		t.Errorf("expected original stars=3, got %d", stars)
 	}
 }
 

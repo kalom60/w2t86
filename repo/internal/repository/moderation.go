@@ -116,11 +116,16 @@ func (r *ModerationRepository) GetPendingReview(limit, offset int) ([]Moderation
 	return items, nil
 }
 
-// ApproveComment sets a comment's status to 'active'. Reports are kept for audit.
+// ApproveComment reinstates a collapsed comment to 'visible' status.
+// Reports are kept for audit purposes but the comment re-enters the normal
+// lifecycle: it will auto-collapse again if it accumulates 3 new unique
+// reports, because the ReportComment collapse predicate checks status='visible'.
+// Using 'active' (the previous value) broke this re-collapse cycle because the
+// collapse UPDATE only matched status='visible'.
 func (r *ModerationRepository) ApproveComment(commentID, moderatorID int64) error {
 	const q = `
 		UPDATE comments
-		SET    status     = 'active',
+		SET    status     = 'visible',
 		       updated_at = datetime('now')
 		WHERE  id = ? AND status = 'collapsed'`
 

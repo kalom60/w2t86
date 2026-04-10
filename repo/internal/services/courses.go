@@ -65,8 +65,21 @@ func (s *CourseService) GetSections(courseID int64) ([]models.CourseSection, err
 
 // AddPlanItem adds (or updates) a material demand line for a course.
 // sectionID is optional: pass nil to create a whole-course plan item.
-// Verifies the material exists and is active before recording the plan.
-func (s *CourseService) AddPlanItem(courseID, materialID int64, sectionID *int64, requestedQty int, notes string) (*models.CoursePlan, error) {
+// Verifies caller owns the course (or is admin) and that the material exists
+// and is active before recording the plan.
+func (s *CourseService) AddPlanItem(courseID, materialID int64, sectionID *int64, requestedQty int, notes string, callerID int64, isAdmin bool) (*models.CoursePlan, error) {
+	if _, err := s.GetCourse(courseID, callerID, isAdmin); err != nil {
+		return nil, fmt.Errorf("service: AddPlanItem: %w", err)
+	}
+	if sectionID != nil {
+		sec, err := s.courseRepo.GetSectionByID(*sectionID)
+		if err != nil {
+			return nil, fmt.Errorf("service: AddPlanItem: section not found: %w", err)
+		}
+		if sec.CourseID != courseID {
+			return nil, errors.New("service: AddPlanItem: section does not belong to this course")
+		}
+	}
 	if requestedQty <= 0 {
 		return nil, errors.New("service: AddPlanItem: requested_qty must be positive")
 	}
@@ -81,11 +94,15 @@ func (s *CourseService) AddPlanItem(courseID, materialID int64, sectionID *int64
 }
 
 // ApprovePlanItem approves a plan item (admin/instructor workflow).
-func (s *CourseService) ApprovePlanItem(planID int64, approvedQty int) error {
+// Verifies that the caller owns the course (or is admin) before approving.
+func (s *CourseService) ApprovePlanItem(courseID, planID int64, approvedQty int, callerID int64, isAdmin bool) error {
+	if _, err := s.GetCourse(courseID, callerID, isAdmin); err != nil {
+		return fmt.Errorf("service: ApprovePlanItem: %w", err)
+	}
 	if approvedQty < 0 {
 		return errors.New("service: ApprovePlanItem: approved_qty cannot be negative")
 	}
-	return s.courseRepo.ApprovePlanItem(planID, approvedQty)
+	return s.courseRepo.ApprovePlanItem(courseID, planID, approvedQty)
 }
 
 // GetPlanItems returns all material demand lines for a course.

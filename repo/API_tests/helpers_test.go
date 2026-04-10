@@ -20,12 +20,14 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	fibercsrf "github.com/gofiber/fiber/v2/middleware/csrf"
 	"github.com/gofiber/template/html/v2"
 
 	"w2t86/internal/config"
 	"w2t86/internal/handlers"
 	"w2t86/internal/middleware"
 	"w2t86/internal/models"
+	"w2t86/internal/observability"
 	"w2t86/internal/repository"
 	"w2t86/internal/services"
 	"w2t86/internal/testutil"
@@ -70,7 +72,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	materialHandler := handlers.NewMaterialHandler(materialService)
 	orderHandler := handlers.NewOrderHandler(orderService)
 	distributionHandler := handlers.NewDistributionHandler(distributionService)
-	messagingHandler := handlers.NewMessagingHandler(messagingService)
+	messagingHandler := handlers.NewMessagingHandler(messagingService, "UTC")
 	moderationHandler := handlers.NewModerationHandler(moderationService, messagingService)
 	analyticsHandler := handlers.NewAnalyticsHandler(analyticsService)
 	adminHandler := handlers.NewAdminHandler(adminService, authService)
@@ -115,10 +117,13 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	engine.AddFunc("dec", func(n int) int { return n - 1 })
 	engine.AddFunc("inc", func(n int) int { return n + 1 })
 	engine.AddFunc("deref", func(v interface{}) interface{} { return v })
-	engine.AddFunc("hourRange", func() []int {
-		hours := make([]int, 24)
+	engine.AddFunc("hourRange", func() []map[string]interface{} {
+		hours := make([]map[string]interface{}, 24)
 		for i := range hours {
-			hours[i] = i
+			hours[i] = map[string]interface{}{
+				"Val":   i,
+				"Label": fmt.Sprintf("%02d:00", i),
+			}
 		}
 		return hours
 	})
@@ -136,12 +141,33 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 		},
 	})
 
-	authMW := middleware.NewAuthMiddleware(sessionRepo, userRepo)
+	// Apply CSRF middleware globally, mirroring production.
+	// In production, CSRF runs after RequireAuth (it's added via group.Use after the
+	// group constructor sets RequireAuth). Replicate that ordering by skipping CSRF
+	// for unauthenticated requests — RequireAuth will reject those with 401/302.
+	app.Use(fibercsrf.New(fibercsrf.Config{
+		KeyLookup:      "header:X-Csrf-Token",
+		CookieName:     "csrf_token",
+		CookieHTTPOnly: false,
+		CookieSameSite: "Strict",
+		Next: func(c *fiber.Ctx) bool {
+			p := c.Path()
+			if p == "/login" || strings.HasPrefix(p, "/share/") || p == "/health" {
+				return true
+			}
+			// Skip for unauthenticated requests: auth middleware handles them.
+			return c.Cookies("session_token") == ""
+		},
+	}))
+
+	authMW := middleware.NewAuthMiddleware(sessionRepo, userRepo, cfg.SessionSecret)
 	requireAuth := authMW.RequireAuth()
 	requireAdmin := middleware.RequireRole("admin")
 	requireMod := middleware.RequireRole("moderator", "admin")
 	requireClerk := middleware.RequireRole("clerk", "admin")
-	requireInstr := middleware.RequireRole("instructor", "admin")
+	// requireInstr mirrors the production requireInstrAdmin: accepts instructor,
+	// manager (the explicit prompt role), and admin.
+	requireInstr := middleware.RequireRole("instructor", "manager", "admin")
 	commentRL := middleware.CommentRateLimit()
 
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -200,6 +226,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Post("/inbox/subscribe", requireAuth, messagingHandler.Subscribe)
 	app.Post("/inbox/unsubscribe", requireAuth, messagingHandler.Unsubscribe)
 	app.Get("/inbox/badge", requireAuth, messagingHandler.Badge)
+	app.Get("/inbox/sse", requireAuth, messagingHandler.InboxSSE)
 
 	// Moderation.
 	app.Get("/moderation", requireAuth, requireMod, moderationHandler.Queue)
@@ -243,8 +270,20 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/admin/duplicates", requireAuth, requireAdmin, adminHandler.DuplicatesPage)
 	app.Post("/admin/duplicates/merge", requireAuth, requireAdmin, adminHandler.MergeUsers)
 	app.Get("/admin/audit", requireAuth, requireAdmin, adminHandler.AuditLogPage)
+	app.Get("/metrics", requireAuth, requireAdmin, func(c *fiber.Ctx) error {
+		return c.JSON(observability.M.ToJSON())
+	})
+	app.Get("/api/stats/:stat", requireAuth, analyticsHandler.DashboardStat)
 	app.Get("/analytics/export/orders", requireAuth, requireAdmin, analyticsHandler.ExportOrders)
 	app.Get("/analytics/export/distribution", requireAuth, requireAdmin, analyticsHandler.ExportDistribution)
+	app.Get("/analytics/map", requireAuth, requireAdmin, analyticsHandler.MapPage)
+	app.Get("/analytics/map/data", requireAuth, requireAdmin, analyticsHandler.MapData)
+	app.Post("/analytics/map/compute", requireAuth, requireAdmin, analyticsHandler.ComputeGrid)
+	app.Get("/analytics/map/buffer", requireAuth, requireAdmin, analyticsHandler.BufferQuery)
+	app.Get("/analytics/map/poi-density", requireAuth, requireAdmin, analyticsHandler.POIDensity)
+	app.Get("/analytics/map/trajectory/:materialID", requireAuth, requireAdmin, analyticsHandler.Trajectory)
+	app.Get("/analytics/map/regions", requireAuth, requireAdmin, analyticsHandler.RegionAggregate)
+	app.Post("/analytics/map/regions/compute", requireAuth, requireAdmin, analyticsHandler.ComputeRegions)
 
 	return app, db, func() {}
 }
@@ -310,11 +349,43 @@ func makeRequest(app *fiber.App, method, path, body, cookie, ct string, extra ..
 			req.Header.Set(k, v)
 		}
 	}
+	// For state-changing methods with an authenticated session, automatically
+	// fetch and attach the CSRF token unless the caller already provided one.
+	if cookie != "" && req.Header.Get("X-Csrf-Token") == "" {
+		m := strings.ToUpper(method)
+		if m == http.MethodPost || m == http.MethodPut || m == http.MethodDelete || m == http.MethodPatch {
+			if tok := fetchCSRFToken(app, cookie); tok != "" {
+				req.Header.Set("X-Csrf-Token", tok)
+				req.Header.Set("Cookie", cookie+"; csrf_token="+tok)
+			}
+		}
+	}
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		return &http.Response{StatusCode: http.StatusInternalServerError}
 	}
 	return resp
+}
+
+// fetchCSRFToken performs a GET to a CSRF-protected route to obtain the
+// csrf_token cookie value. The cookie value IS the token (double-submit pattern).
+// Returns empty string if the request fails or no csrf_token cookie is present.
+func fetchCSRFToken(app *fiber.App, sessionCookie string) string {
+	req := httptest.NewRequest(http.MethodGet, "/materials", nil)
+	if sessionCookie != "" {
+		req.Header.Set("Cookie", sessionCookie)
+	}
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	for _, c := range resp.Cookies() {
+		if c.Name == "csrf_token" {
+			return c.Value
+		}
+	}
+	return ""
 }
 
 func htmx() map[string]string { return map[string]string{"HX-Request": "true"} }
@@ -335,6 +406,7 @@ func createMaterial(t *testing.T, db *sql.DB) *models.Material {
 		Title:        fmt.Sprintf("API Book %d", time.Now().UnixNano()),
 		TotalQty:     10,
 		AvailableQty: 10,
+		Price:        9.99,
 		Status:       "active",
 	}
 	created, err := repo.Create(m)

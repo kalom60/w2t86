@@ -282,7 +282,7 @@ func TestInventory_OrderCancel_RollsBackInventory(t *testing.T) {
 
 	// Place order (reserves 2 units).
 	order, err := orderRepo.Create(userID, []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 2, UnitPrice: 5.0},
+		{MaterialID: matID, Qty: 2},
 	})
 	if err != nil {
 		t.Fatalf("Create order: %v", err)
@@ -305,5 +305,211 @@ func TestInventory_OrderCancel_RollsBackInventory(t *testing.T) {
 	}
 	if rsv != 0 {
 		t.Errorf("expected reserved_qty=0 after cancel, got %d", rsv)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Release guard (invariant: reserved_qty must never go negative)
+// ---------------------------------------------------------------------------
+
+// TestInventory_Release_GuardsAgainstNegativeReserved verifies that Release
+// returns an error instead of driving reserved_qty below zero when called on a
+// material whose reserved_qty is already zero (the post-fulfillment state).
+func TestInventory_Release_GuardsAgainstNegativeReserved(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	// Seed a material with reserved_qty=0 (as it would be after fulfillment).
+	id := seedMaterial(t, db, 10, 10, 0)
+
+	err := matRepo.Release(id, 1)
+	if err == nil {
+		t.Error("expected Release to fail when reserved_qty=0, but got nil error")
+	}
+
+	// Quantities must remain unchanged.
+	avail, rsv := getMaterialQtys(t, db, id)
+	if rsv < 0 {
+		t.Errorf("reserved_qty went negative (%d) after failed Release", rsv)
+	}
+	if avail != 10 {
+		t.Errorf("available_qty changed unexpectedly: got %d", avail)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ReturnToStock (post-fulfillment return path)
+// ---------------------------------------------------------------------------
+
+func TestInventory_ReturnToStock_IncreasesAvailable(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	// Simulate post-fulfillment state: 8 available, 0 reserved (2 in the field).
+	id := seedMaterial(t, db, 10, 8, 0)
+	if err := matRepo.ReturnToStock(id, 2); err != nil {
+		t.Fatalf("ReturnToStock: %v", err)
+	}
+	avail, rsv := getMaterialQtys(t, db, id)
+	if avail != 10 {
+		t.Errorf("expected available_qty=10 after return, got %d", avail)
+	}
+	if rsv != 0 {
+		t.Errorf("ReturnToStock must not change reserved_qty; got %d", rsv)
+	}
+}
+
+func TestInventory_ReturnToStock_DoesNotChangeReserved(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	// Material with some reserved stock (unrelated active order).
+	id := seedMaterial(t, db, 10, 5, 3)
+	if err := matRepo.ReturnToStock(id, 2); err != nil {
+		t.Fatalf("ReturnToStock: %v", err)
+	}
+	_, rsv := getMaterialQtys(t, db, id)
+	if rsv != 3 {
+		t.Errorf("reserved_qty should remain 3 after ReturnToStock, got %d", rsv)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DirectIssue (new-leg of post-fulfillment exchange)
+// ---------------------------------------------------------------------------
+
+func TestInventory_DirectIssue_DecreasesAvailable(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	id := seedMaterial(t, db, 10, 10, 0)
+	if err := matRepo.DirectIssue(id, 3); err != nil {
+		t.Fatalf("DirectIssue: %v", err)
+	}
+	avail, rsv := getMaterialQtys(t, db, id)
+	if avail != 7 {
+		t.Errorf("expected available_qty=7, got %d", avail)
+	}
+	if rsv != 0 {
+		t.Errorf("DirectIssue must not change reserved_qty; got %d", rsv)
+	}
+}
+
+func TestInventory_DirectIssue_InsufficientStock_Fails(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	id := seedMaterial(t, db, 5, 2, 0)
+	err := matRepo.DirectIssue(id, 3)
+	if err == nil {
+		t.Error("expected error when DirectIssue exceeds available_qty, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Post-fulfillment return: reserved_qty must stay non-negative end-to-end.
+// ---------------------------------------------------------------------------
+
+// TestInventory_PostFulfillment_Return_ReservedNonNegative exercises the full
+// order → complete → return path and asserts that reserved_qty never goes
+// negative at any point.
+func TestInventory_PostFulfillment_Return_ReservedNonNegative(t *testing.T) {
+	db := testutil.NewTestDBNoFK(t)
+	orderRepo := repository.NewOrderRepository(db)
+	matRepo := repository.NewMaterialRepository(db)
+
+	// Seed user and material.
+	var userID int64
+	if err := db.QueryRow(
+		`INSERT INTO users (username, email, password_hash, role) VALUES (?, 'ret@x.com', 'h', 'student') RETURNING id`,
+		fmt.Sprintf("ret_user_%d", testSeq()),
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	var matID int64
+	if err := db.QueryRow(
+		`INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status)
+		 VALUES ('Return Book', 5, 5, 0, 'active') RETURNING id`,
+	).Scan(&matID); err != nil {
+		t.Fatalf("insert material: %v", err)
+	}
+
+	// Place order (reserves 2 units: available 3, reserved 2).
+	order, err := orderRepo.Create(userID, []repository.OrderItemInput{
+		{MaterialID: matID, Qty: 2},
+	})
+	if err != nil {
+		t.Fatalf("Create order: %v", err)
+	}
+	avail, rsv := getMaterialQtys(t, db, matID)
+	if avail != 3 || rsv != 2 {
+		t.Fatalf("after order: avail=%d rsv=%d (want 3/2)", avail, rsv)
+	}
+
+	// Transition through the lifecycle to completed.
+	if err := orderRepo.Transition(order.ID, userID, "pending_shipment", "paid", matRepo); err != nil {
+		t.Fatalf("→ pending_shipment: %v", err)
+	}
+	if err := orderRepo.Transition(order.ID, userID, "in_transit", "shipped", matRepo); err != nil {
+		t.Fatalf("→ in_transit: %v", err)
+	}
+	if err := orderRepo.Transition(order.ID, userID, "completed", "delivered", matRepo); err != nil {
+		t.Fatalf("→ completed: %v", err)
+	}
+
+	// After completion: reserved_qty decremented to 0, available unchanged (3).
+	avail, rsv = getMaterialQtys(t, db, matID)
+	if rsv != 0 {
+		t.Fatalf("after completion: reserved_qty=%d (want 0)", rsv)
+	}
+	if avail != 3 {
+		t.Fatalf("after completion: available_qty=%d (want 3)", avail)
+	}
+
+	// Post-fulfillment return: ReturnToStock must add to available, not touch reserved.
+	if err := matRepo.ReturnToStock(matID, 2); err != nil {
+		t.Fatalf("ReturnToStock: %v", err)
+	}
+	avail, rsv = getMaterialQtys(t, db, matID)
+	if rsv < 0 {
+		t.Errorf("INVARIANT VIOLATED: reserved_qty went negative after post-fulfillment return: %d", rsv)
+	}
+	if rsv != 0 {
+		t.Errorf("reserved_qty should still be 0 after return, got %d", rsv)
+	}
+	if avail != 5 {
+		t.Errorf("available_qty should be 5 after return, got %d", avail)
+	}
+}
+
+// TestInventory_PostFulfillment_Exchange_ReservedNonNegative exercises the
+// exchange path: old copy returned (ReturnToStock) + new copy direct-issued
+// (DirectIssue). reserved_qty must remain non-negative throughout.
+func TestInventory_PostFulfillment_Exchange_ReservedNonNegative(t *testing.T) {
+	db := testutil.NewTestDBNoFK(t)
+	matRepo := repository.NewMaterialRepository(db)
+
+	// Simulate post-fulfillment: old material has 0 reserved (fulfilled).
+	oldID := seedMaterial(t, db, 5, 3, 0)
+	// New material for exchange: has available stock.
+	newID := seedMaterial(t, db, 5, 5, 0)
+
+	// Old copy returned.
+	if err := matRepo.ReturnToStock(oldID, 1); err != nil {
+		t.Fatalf("ReturnToStock old: %v", err)
+	}
+	// New copy directly issued.
+	if err := matRepo.DirectIssue(newID, 1); err != nil {
+		t.Fatalf("DirectIssue new: %v", err)
+	}
+
+	_, oldRsv := getMaterialQtys(t, db, oldID)
+	_, newRsv := getMaterialQtys(t, db, newID)
+
+	if oldRsv < 0 {
+		t.Errorf("INVARIANT VIOLATED: old material reserved_qty=%d (negative after exchange return)", oldRsv)
+	}
+	if newRsv < 0 {
+		t.Errorf("INVARIANT VIOLATED: new material reserved_qty=%d (negative after exchange issue)", newRsv)
 	}
 }

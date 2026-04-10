@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/hex"
+	"errors"
 	"strconv"
 
 	"github.com/gofiber/fiber/v2"
@@ -10,6 +11,38 @@ import (
 	"w2t86/internal/observability"
 	"w2t86/internal/services"
 )
+
+// validEntityTypes is the closed set of entity types that may carry custom fields.
+var validEntityTypes = map[string]bool{
+	"user":     true,
+	"course":   true,
+	"material": true,
+	"location": true,
+}
+
+// extractEntityParams resolves entity_type and entity_id from the request URL.
+// It supports both the generic routes (/admin/fields/:entity_type/:entity_id)
+// and the legacy user-scoped routes (/admin/users/:id/fields).
+// Returns an error when entity_type is not in validEntityTypes or entity_id is
+// not a valid integer.
+func extractEntityParams(c *fiber.Ctx) (entityType string, entityID int64, err error) {
+	entityType = c.Params("entity_type")
+	if entityType == "" {
+		entityType = "user" // legacy route: /admin/users/:id/fields
+	}
+	if !validEntityTypes[entityType] {
+		return "", 0, errors.New("invalid entity type: must be user, course, material, or location")
+	}
+	idStr := c.Params("entity_id")
+	if idStr == "" {
+		idStr = c.Params("id") // legacy route param name
+	}
+	id, parseErr := strconv.ParseInt(idStr, 10, 64)
+	if parseErr != nil || id <= 0 {
+		return "", 0, errors.New("invalid entity ID")
+	}
+	return entityType, id, nil
+}
 
 // AdminHandler serves all admin UI routes: user management, custom fields,
 // duplicate detection, merging, and audit log.
@@ -71,7 +104,7 @@ func (h *AdminHandler) CreateUser(c *fiber.Ctx) error {
 		role = "student"
 	}
 
-	user, err := h.adminService.CreateUser(username, email, password, role, fullName)
+	user, err := h.adminService.CreateUser(username, email, password, role, fullName, encKeyFromContext(c))
 	if err != nil {
 		observability.App.Warn("create user rejected", "username", username, "role", role, "error", err)
 		return c.Status(fiber.StatusUnprocessableEntity).Render("admin/users/new", fiber.Map{
@@ -96,7 +129,7 @@ func (h *AdminHandler) UserProfile(c *fiber.Ctx) error {
 	}
 
 	encKey := encKeyFromContext(c)
-	fields, err := h.adminService.GetCustomFields(int64(id), encKey)
+	fields, err := h.adminService.GetCustomFields("user", int64(id), encKey)
 	if err != nil {
 		observability.App.Warn("get custom fields failed", "target_user_id", id, "error", err)
 		fields = nil
@@ -117,19 +150,26 @@ func (h *AdminHandler) UserProfile(c *fiber.Ctx) error {
 		users = nil
 	}
 	var targetUser interface{}
-	for _, u := range users {
-		if u.ID == int64(id) {
-			targetUser = u
+	for i := range users {
+		if users[i].ID == int64(id) {
+			// Decrypt sensitive fields before rendering so the admin sees plaintext.
+			decrypted := h.adminService.DecryptUser(&users[i], encKey)
+			targetUser = decrypted
 			break
 		}
 	}
 
+	displayName := h.adminService.GetEntityDisplayName("user", int64(id))
+
 	return c.Render("admin/users/profile", fiber.Map{
-		"Title":      "User Profile",
-		"User":       middleware.GetUser(c),
-		"TargetUser": targetUser,
-		"Fields":     fields,
-		"AuditLog":   auditLog,
+		"Title":             "User Profile — " + displayName,
+		"User":              middleware.GetUser(c),
+		"EntityType":        "user",
+		"EntityDisplayName": displayName,
+		"TargetID":          int64(id),
+		"TargetUser":        targetUser,
+		"Fields":            fields,
+		"AuditLog":          auditLog,
 	}, "layouts/main")
 }
 
@@ -182,67 +222,90 @@ func (h *AdminHandler) UnlockUser(c *fiber.Ctx) error {
 // Custom fields
 // ---------------------------------------------------------------
 
-// CustomFieldsPage handles GET /admin/users/:id/fields.
+// CustomFieldsPage handles GET /admin/fields/:entity_type/:entity_id
+// and the legacy GET /admin/users/:id/fields.
 func (h *AdminHandler) CustomFieldsPage(c *fiber.Ctx) error {
-	id, err := c.ParamsInt("id")
+	entityType, entityID, err := extractEntityParams(c)
 	if err != nil {
-		return apiErr(c, fiber.StatusBadRequest, "Invalid user ID")
+		return apiErr(c, fiber.StatusBadRequest, err.Error())
 	}
 
+	displayName := h.adminService.GetEntityDisplayName(entityType, entityID)
+
 	encKey := encKeyFromContext(c)
-	fields, err := h.adminService.GetCustomFields(int64(id), encKey)
+	fields, err := h.adminService.GetCustomFields(entityType, entityID, encKey)
 	if err != nil {
-		observability.App.Warn("get custom fields failed", "target_user_id", id, "error", err)
+		observability.App.Warn("get custom fields failed",
+			"entity_type", entityType, "entity_id", entityID, "error", err)
 		fields = nil
 	}
 
 	return c.Render("admin/users/profile", fiber.Map{
-		"Title":      "Custom Fields",
-		"User":       middleware.GetUser(c),
-		"TargetID":   id,
-		"Fields":     fields,
-		"FieldsOnly": true,
+		"Title":             "Custom Fields — " + displayName,
+		"User":              middleware.GetUser(c),
+		"EntityType":        entityType,
+		"EntityDisplayName": displayName,
+		"TargetID":          entityID,
+		"Fields":            fields,
 	}, "layouts/main")
 }
 
-// SetCustomField handles POST /admin/users/:id/fields.
+// SetCustomField handles POST /admin/fields/:entity_type/:entity_id
+// and the legacy POST /admin/users/:id/fields.
 func (h *AdminHandler) SetCustomField(c *fiber.Ctx) error {
-	id, err := c.ParamsInt("id")
+	entityType, entityID, err := extractEntityParams(c)
 	if err != nil {
-		return apiErr(c, fiber.StatusBadRequest, "Invalid user ID")
+		return apiErr(c, fiber.StatusBadRequest, err.Error())
 	}
 
 	name := c.FormValue("field_name")
 	value := c.FormValue("field_value")
 	encrypt := c.FormValue("encrypt") == "true" || c.FormValue("encrypt") == "1"
+	reason := c.FormValue("reason")
+	if reason == "" {
+		reason = "admin field update"
+	}
 
+	actor := middleware.GetUser(c)
 	encKey := encKeyFromContext(c)
-	if err := h.adminService.SetCustomField(int64(id), name, value, encrypt, encKey); err != nil {
+	if err := h.adminService.SetCustomField(entityType, entityID, name, value, encrypt, encKey, actor.ID, reason); err != nil {
 		return htmxErr(c, fiber.StatusUnprocessableEntity, "Could not save field. Please try again.")
 	}
 
 	if c.Get("HX-Request") == "true" {
 		return c.Render("partials/flash", fiber.Map{"Message": "Field saved."})
 	}
-	return c.Redirect("/admin/users/"+strconv.Itoa(id)+"/fields", fiber.StatusFound)
+	return c.Redirect(
+		"/admin/fields/"+entityType+"/"+strconv.FormatInt(entityID, 10),
+		fiber.StatusFound,
+	)
 }
 
-// DeleteCustomField handles DELETE /admin/users/:id/fields/:name.
+// DeleteCustomField handles DELETE /admin/fields/:entity_type/:entity_id/:name
+// and the legacy DELETE /admin/users/:id/fields/:name.
 func (h *AdminHandler) DeleteCustomField(c *fiber.Ctx) error {
-	id, err := c.ParamsInt("id")
+	entityType, entityID, err := extractEntityParams(c)
 	if err != nil {
-		return apiErr(c, fiber.StatusBadRequest, "Invalid user ID")
+		return apiErr(c, fiber.StatusBadRequest, err.Error())
 	}
 	name := c.Params("name")
+	reason := c.FormValue("reason")
+	if reason == "" {
+		reason = "admin field delete"
+	}
 
-	if err := h.adminService.DeleteCustomField(int64(id), name); err != nil {
+	actor := middleware.GetUser(c)
+	if err := h.adminService.DeleteCustomField(entityType, entityID, name, actor.ID, reason); err != nil {
 		return htmxErr(c, fiber.StatusUnprocessableEntity, "Could not delete field. Please try again.")
 	}
 
 	if c.Get("HX-Request") == "true" {
 		return c.Render("partials/flash", fiber.Map{"Message": "Field deleted."})
 	}
-	return c.Redirect("/admin/users/"+strconv.Itoa(id)+"/fields", fiber.StatusFound)
+	return c.Redirect(
+		"/admin/fields/"+entityType+"/"+strconv.FormatInt(entityID, 10),
+		fiber.StatusFound,
+	)
 }
 
 // ---------------------------------------------------------------

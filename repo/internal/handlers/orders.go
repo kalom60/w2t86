@@ -64,10 +64,21 @@ func (h *OrderHandler) OrderDetail(c *fiber.Ctx) error {
 		return apiErr(c, fiber.StatusNotFound, "Order not found")
 	}
 
-	// Students may only view their own orders.
-	if user.Role == "student" && order.UserID != user.ID {
-		observability.Security.Warn("unauthorized order access attempt",
-			"user_id", user.ID, "order_id", id, "order_owner_id", order.UserID, "ip", c.IP())
+	// Enforce explicit allowlist: the order owner may always view their own
+	// order; admin, instructor, and clerk have operational need-to-know.
+	// All other roles (e.g. moderator) are denied.
+	switch user.Role {
+	case "admin", "instructor", "clerk":
+		// Permitted — these roles have operational need-to-know for order details.
+	case "student":
+		if order.UserID != user.ID {
+			observability.Security.Warn("unauthorized order access attempt",
+				"user_id", user.ID, "order_id", id, "order_owner_id", order.UserID, "ip", c.IP())
+			return apiErr(c, fiber.StatusForbidden, "You do not have permission to perform this action")
+		}
+	default:
+		observability.Security.Warn("unauthorized order access attempt by non-student role",
+			"user_id", user.ID, "role", user.Role, "order_id", id, "ip", c.IP())
 		return apiErr(c, fiber.StatusForbidden, "You do not have permission to perform this action")
 	}
 
@@ -104,10 +115,11 @@ func (h *OrderHandler) CartPage(c *fiber.Ctx) error {
 func (h *OrderHandler) PlaceOrder(c *fiber.Ctx) error {
 	user := middleware.GetUser(c)
 
-	// Parse multi-value form fields: material_id[] and qty[] and unit_price[].
+	// Parse multi-value form fields: material_id[] and qty[].
+	// unit_price is deliberately NOT parsed from the client — the server
+	// fetches the authoritative price from the materials catalog.
 	materialIDs := c.Request().PostArgs().PeekMulti("material_id")
 	qtys := c.Request().PostArgs().PeekMulti("qty")
-	prices := c.Request().PostArgs().PeekMulti("unit_price")
 
 	if len(materialIDs) == 0 || len(materialIDs) != len(qtys) {
 		return htmxErr(c, fiber.StatusBadRequest, "Invalid cart data")
@@ -123,14 +135,9 @@ func (h *OrderHandler) PlaceOrder(c *fiber.Ctx) error {
 		if err != nil || qty <= 0 {
 			return htmxErr(c, fiber.StatusBadRequest, "Invalid quantity in cart")
 		}
-		var unitPrice float64
-		if i < len(prices) {
-			unitPrice, _ = strconv.ParseFloat(string(prices[i]), 64)
-		}
 		items = append(items, repository.OrderItemInput{
 			MaterialID: mid,
 			Qty:        qty,
-			UnitPrice:  unitPrice,
 		})
 	}
 

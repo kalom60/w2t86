@@ -106,7 +106,7 @@ for i in "${!SUITE_LABELS[@]}"; do
   info "Running: $label"
 
   # Build the go test command.
-  cmd=(go test $RACE $VERBOSE -timeout 120s)
+  cmd=(go test -tags sqlite_fts5 $RACE $VERBOSE -timeout 120s)
   if [[ -n "$run_filter" ]]; then
     cmd+=(-run "$run_filter")
   fi

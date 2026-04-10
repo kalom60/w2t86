@@ -67,7 +67,8 @@ func (s *OrderService) PlaceOrder(userID int64, items []repository.OrderItemInpu
 // Student actions
 // ---------------------------------------------------------------
 
-// ConfirmPayment transitions an order from pending_payment → pending_shipment.
+// ConfirmPayment transitions an order from pending_payment → pending_shipment
+// and atomically records a financial receipt for full auditability.
 // Only the order owner may confirm payment.
 func (s *OrderService) ConfirmPayment(orderID, userID int64) error {
 	order, err := s.orderRepo.GetByID(orderID)
@@ -80,8 +81,10 @@ func (s *OrderService) ConfirmPayment(orderID, userID int64) error {
 	if order.Status != "pending_payment" {
 		return fmt.Errorf("service: ConfirmPayment: order is %q, expected pending_payment", order.Status)
 	}
-	if err := s.orderRepo.Transition(orderID, userID, "pending_shipment", "payment confirmed", s.materialRepo); err != nil {
-		return err
+	// ConfirmPaymentWithReceipt atomically advances status AND writes the
+	// financial receipt so the audit trail is never broken.
+	if err := s.orderRepo.ConfirmPaymentWithReceipt(orderID, userID); err != nil {
+		return fmt.Errorf("service: ConfirmPayment: %w", err)
 	}
 	observability.Orders.Info("payment confirmed", "order_id", orderID, "user_id", userID)
 	return nil
@@ -193,8 +196,13 @@ func (s *OrderService) RequestReturn(orderID, userID int64, reqType, reason stri
 		return nil, fmt.Errorf("service: RequestReturn: invalid type %q (must be return, exchange, or refund)", reqType)
 	}
 
-	// Enforce 14-day window.
-	if !repository.WithinReturnWindow(order.UpdatedAt) {
+	// Enforce 14-day window anchored to the completion timestamp, not updated_at.
+	// updated_at changes on every status mutation; completed_at is stamped exactly
+	// once when the order transitions to "completed" and never changes afterward.
+	if order.CompletedAt == nil {
+		return nil, errors.New("service: RequestReturn: order has no completion timestamp")
+	}
+	if !repository.WithinReturnWindow(*order.CompletedAt) {
 		return nil, errors.New("service: RequestReturn: the 14-day return window has expired")
 	}
 
@@ -224,8 +232,11 @@ func (s *OrderService) RequestReturn(orderID, userID int64, reqType, reason stri
 // When the request type is "refund" or "return", a financial_transaction record
 // is created for traceability.
 func (s *OrderService) ApproveReturn(requestID, actorID int64, role string) error {
-	if role != "admin" && role != "instructor" {
-		return errors.New("service: ApproveReturn: only managers (admin/instructor) may approve return requests")
+	// "manager" is the explicit role name from the prompt specification.
+	// "instructor" is the equivalent role in the database (same capabilities).
+	// Both are accepted here so that deployments using either naming convention work.
+	if role != "admin" && role != "instructor" && role != "manager" {
+		return errors.New("service: ApproveReturn: only managers (admin/instructor/manager) may approve return requests")
 	}
 	rr, err := s.orderRepo.GetReturnRequestByID(requestID)
 	if err != nil {
@@ -249,26 +260,22 @@ func (s *OrderService) ApproveReturn(requestID, actorID int64, role string) erro
 		}
 	}
 
-	if err := s.orderRepo.ResolveReturn(requestID, actorID, true); err != nil {
-		return err
-	}
-
-	// Record a financial transaction for refund or return types.
+	// For refund/return types, approval and financial record must both succeed
+	// atomically so the audit trail is never broken.
 	if rr.Type == "refund" || rr.Type == "return" {
-		// Look up the order amount for the refund value.
 		amount := 0.0
 		if order, oErr := s.orderRepo.GetByID(rr.OrderID); oErr == nil {
 			amount = order.TotalAmount
 		}
-		txType := "refund"
 		note := "approved " + rr.Type + " request"
-		rrID := requestID
-		oID := rr.OrderID
-		if _, ftErr := s.orderRepo.CreateFinancialTransaction(
-			&oID, &rrID, txType, amount, actorID, note,
-		); ftErr != nil {
-			// Non-fatal: log but do not fail the approval.
-			observability.Orders.Warn("financial transaction record failed", "request_id", requestID, "error", ftErr)
+		if err := s.orderRepo.ApproveReturnWithFinancialRecord(
+			requestID, rr.OrderID, actorID, "refund", amount, note,
+		); err != nil {
+			return fmt.Errorf("service: ApproveReturn: atomic approval+financial record: %w", err)
+		}
+	} else {
+		if err := s.orderRepo.ResolveReturn(requestID, actorID, true); err != nil {
+			return err
 		}
 	}
 

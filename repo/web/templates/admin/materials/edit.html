@@ -99,17 +99,25 @@
       </div>
 
       <div class="row g-3 mb-4">
-        <div class="col-md-4">
+        <div class="col-md-3">
+          <label class="form-label" for="mat-price">Unit Price</label>
+          <div class="input-group">
+            <span class="input-group-text">$</span>
+            <input class="form-control" type="number" id="mat-price" name="price"
+              min="0" step="0.01" value="{{.Material.Price}}">
+          </div>
+        </div>
+        <div class="col-md-3">
           <label class="form-label" for="mat-total-qty">Total Qty</label>
           <input class="form-control" type="number" id="mat-total-qty" name="total_qty" min="0"
             value="{{.Material.TotalQty}}">
         </div>
-        <div class="col-md-4">
+        <div class="col-md-3">
           <label class="form-label" for="mat-avail-qty">Available Qty</label>
           <input class="form-control" type="number" id="mat-avail-qty" name="available_qty" min="0"
             value="{{.Material.AvailableQty}}">
         </div>
-        <div class="col-md-4">
+        <div class="col-md-3">
           <label class="form-label" for="mat-status">Status</label>
           <select class="form-select" id="mat-status" name="status">
             <option value="active" {{if eq .Material.Status "active"}}selected{{end}}>Active</option>

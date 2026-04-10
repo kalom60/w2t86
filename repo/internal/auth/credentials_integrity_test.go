@@ -1,28 +1,22 @@
 package auth_test
 
-// credentials_integrity_test.go — authoritative programmatic proof that the
-// default admin credential seeded in migrations/001_schema.sql is valid.
+// credentials_integrity_test.go — programmatic proof that the seeded admin
+// account uses a non-functional bootstrap placeholder (not a known exploitable
+// password) and that the placeholder itself cannot authenticate anyone.
 //
-// # Why this file exists
-//
-// A static audit of the SQL migration cannot verify that the bcrypt hash stored
-// there actually corresponds to the documented plaintext password "ChangeMe123!".
-// This test closes that gap: it reads the exact hash string from the migration
-// file at compile-time-resolved path and calls golang.org/x/crypto/bcrypt
-// directly, producing deterministic, repeatable proof without any manual steps.
+// The old approach seeded a known bcrypt hash for "ChangeMe123!" directly in
+// the migration, creating an exploitable window between deployment and first
+// login. The new approach seeds the sentinel string "BOOTSTRAP_PENDING_ROTATION"
+// which is NOT a valid bcrypt hash. On first boot, cmd/server/main.go detects
+// this sentinel, generates a random password, hashes it, and logs it once.
 //
 // Run with:
 //
 //	go test -v ./internal/auth/...
-//
-// Expected output confirms both facts:
-//  1. bcrypt.CompareHashAndPassword returns nil  → password is valid
-//  2. bcrypt cost == 12                          → hash meets security policy
 
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -45,80 +39,61 @@ func migrationPath(t *testing.T) string {
 	return filepath.Join(root, "migrations", "001_schema.sql")
 }
 
-// seedHash reads migrations/001_schema.sql and extracts the bcrypt hash from
-// the admin seed INSERT statement.
-func seedHash(t *testing.T) []byte {
-	t.Helper()
+// TestAdminCredentials_HashMatchesDocumentedPassword verifies that the migration
+// seeds the admin account with the non-functional bootstrap placeholder, NOT a
+// known exploitable bcrypt hash.
+//
+// PASS means: no freshly-initialised database will accept a known password for
+// admin — login is blocked until the server performs auto-rotation on first boot.
+func TestAdminCredentials_HashMatchesDocumentedPassword(t *testing.T) {
 	data, err := os.ReadFile(migrationPath(t))
 	if err != nil {
-		t.Fatalf("read %s: %v", migrationPath(t), err)
+		t.Fatalf("read schema: %v", err)
 	}
-	// Matches the bcrypt hash (3rd positional value) regardless of how many
-	// additional columns follow it in the VALUES list.
-	re := regexp.MustCompile(
-		`VALUES\s*\(\s*'admin'\s*,\s*'[^']+'\s*,\s*'(\$2[aby]\$[^']+)'\s*,`)
-	m := re.FindStringSubmatch(string(data))
-	if len(m) < 2 {
-		t.Fatalf("admin seed hash not found in %s — regex did not match\n"+
-			"Check that the INSERT OR IGNORE for 'admin' is present in the migration.",
-			migrationPath(t))
+	content := string(data)
+
+	const placeholder = "BOOTSTRAP_PENDING_ROTATION"
+	if !strings.Contains(content, placeholder) {
+		t.Errorf("migrations/001_schema.sql must contain the bootstrap placeholder %q — found none\n"+
+			"This means a known credential is seeded, which is a security risk.", placeholder)
 	}
-	return []byte(strings.TrimSpace(m[1]))
+
+	// The legacy known hash must no longer appear.
+	const legacyHash = "$2a$12$fMPISK6tAC1XLVM3JdJQDuB/CrXgdRM.LUPHHu4/VxS/vzihnYyQ."
+	if strings.Contains(content, legacyHash) {
+		t.Errorf("migrations/001_schema.sql still contains the legacy known-default bcrypt hash.\n"+
+			"Replace it with the bootstrap placeholder %q.", placeholder)
+	}
 }
 
-// TestAdminCredentials_HashMatchesDocumentedPassword is the definitive proof
-// required by the audit.
-//
-// It calls bcrypt.CompareHashAndPassword with no application-layer wrappers.
-// PASS means: any freshly initialised database seeded by 001_schema.sql will
-// accept "admin / ChangeMe123!" immediately after first run — no manual steps
-// required.
-func TestAdminCredentials_HashMatchesDocumentedPassword(t *testing.T) {
-	const password = "ChangeMe123!"
-
-	hash := seedHash(t)
-	t.Logf("seed hash: %s", hash)
-
-	if err := bcrypt.CompareHashAndPassword(hash, []byte(password)); err != nil {
-		t.Fatalf(
-			"bcrypt.CompareHashAndPassword failed: %v\n\n"+
-				"The hash in migrations/001_schema.sql does NOT match %q.\n"+
-				"To fix: regenerate the hash at bcrypt cost 12 and update\n"+
-				"        migrations/001_schema.sql and README.md together.",
-			err, password)
-	}
-	t.Logf("PASS: %q is a valid match for the seeded hash", password)
-}
-
-// TestAdminCredentials_HashCost verifies the hash satisfies the minimum security
-// policy of bcrypt cost 12.
+// TestAdminCredentials_HashCost verifies that the bootstrap placeholder is NOT a
+// valid bcrypt hash — confirming that login is blocked until auto-rotation.
 func TestAdminCredentials_HashCost(t *testing.T) {
-	hash := seedHash(t)
-	cost, err := bcrypt.Cost(hash)
-	if err != nil {
-		t.Fatalf("bcrypt.Cost: %v", err)
+	const placeholder = "BOOTSTRAP_PENDING_ROTATION"
+
+	// bcrypt.Cost on a non-bcrypt string must return an error.
+	_, err := bcrypt.Cost([]byte(placeholder))
+	if err == nil {
+		t.Error("BOOTSTRAP_PENDING_ROTATION must NOT be parseable as a bcrypt hash — " +
+			"if bcrypt.Cost succeeds, the placeholder could accidentally authenticate")
 	}
-	if cost < 12 {
-		t.Errorf("bcrypt cost = %d, want >= 12", cost)
-	}
-	t.Logf("bcrypt cost: %d (meets policy minimum of 12)", cost)
 }
 
-// TestAdminCredentials_NearMissesRejected rules out a trivially weak hash by
-// confirming that obvious near-miss passwords do NOT match.
+// TestAdminCredentials_NearMissesRejected verifies that the bootstrap placeholder
+// cannot authenticate any password — not even common guesses.
 func TestAdminCredentials_NearMissesRejected(t *testing.T) {
-	hash := seedHash(t)
+	const placeholder = "BOOTSTRAP_PENDING_ROTATION"
 	cases := []string{
-		"changeme123!",   // wrong capitalisation
-		"ChangeMe123",    // missing punctuation
-		"ChangeMe123!!",  // extra character
-		"ChangeMe123! ",  // trailing space
-		" ChangeMe123!",  // leading space
-		"",               // empty
+		"ChangeMe123!",  // old documented default
+		"changeme123!",  // wrong capitalisation
+		"ChangeMe123",   // missing punctuation
+		"admin",         // obvious guess
+		"password",      // obvious guess
+		"",              // empty
 	}
 	for _, bad := range cases {
-		if err := bcrypt.CompareHashAndPassword(hash, []byte(bad)); err == nil {
-			t.Errorf("bcrypt unexpectedly accepted %q — hash may be too weak or incorrect", bad)
+		if bcrypt.CompareHashAndPassword([]byte(placeholder), []byte(bad)) == nil {
+			t.Errorf("placeholder unexpectedly accepted password %q — it must be non-functional", bad)
 		}
 	}
 }

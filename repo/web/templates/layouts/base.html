@@ -187,6 +187,7 @@
   <div id="toast-container"></div>
 
   <script src="/static/js/htmx.min.js"></script>
+  <script src="/static/js/htmx-ext-sse.js"></script>
   <script defer src="/static/js/alpine.min.js"></script>
   <script src="/static/js/bootstrap.bundle.min.js"></script>
   <script src="/static/js/app.js"></script>
@@ -211,6 +212,19 @@
       var method = (e.detail.verb || '').toUpperCase();
       if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
         e.detail.headers['X-Csrf-Token'] = getCsrfToken();
+      }
+    });
+    // Standard HTML form submissions: inject hidden csrf_token field so that
+    // non-HTMX forms also pass the CSRF check.
+    document.addEventListener('submit', function(e) {
+      var form = e.target;
+      if (form.method && form.method.toUpperCase() !== 'GET' &&
+          !form.querySelector('[name="csrf_token"]')) {
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'csrf_token';
+        input.value = getCsrfToken();
+        form.appendChild(input);
       }
     });
   </script>

@@ -25,35 +25,41 @@ A web-based portal for managing district-wide distribution of educational materi
    go mod tidy
    ```
 
-3. **Download HTMX and Alpine.js**
+3. **Frontend assets (vendored in-repo)**
 
-   Place the minified files in `web/static/js/`:
+   All JavaScript and CSS libraries are vendored directly into `web/static/` so
+   the portal runs **fully offline** without any CDN dependency:
+
+   | File | Library | Version |
+   |---|---|---|
+   | `web/static/js/htmx.min.js` | HTMX | 2.0.4 |
+   | `web/static/js/alpine.min.js` | Alpine.js | 3.14.3 |
+   | `web/static/js/bootstrap.bundle.min.js` | Bootstrap (JS + Popper) | 5.3.3 |
+   | `web/static/js/leaflet.js` | Leaflet | 1.9.4 |
+   | `web/static/js/htmx-ext-sse.js` | HTMX SSE Extension | 2.2.2 |
+   | `web/static/css/bootstrap.min.css` | Bootstrap CSS | 5.3.3 |
+   | `web/static/css/bootstrap-icons.min.css` | Bootstrap Icons | 1.11.3 |
+   | `web/static/css/leaflet.css` | Leaflet CSS | 1.9.4 |
+
+   If you need to refresh assets (e.g. after a security patch), run:
 
    ```bash
-   # HTMX 2.x
-   curl -Lo web/static/js/htmx.min.js \
-     https://unpkg.com/htmx.org@2/dist/htmx.min.js
-
-   # Alpine.js 3.x
-   curl -Lo web/static/js/alpine.min.js \
-     https://unpkg.com/alpinejs@3/dist/cdn.min.js
+   make vendor-assets
    ```
 
 4. **Configure environment**
 
-   Create a `.env` file in the project root (it is gitignored — never commit it):
+   Copy the committed template and fill in the two required secrets:
 
    ```bash
-   # Generate the two required secrets
-   echo "ENCRYPTION_KEY=$(openssl rand -hex 32)" >> .env
-   echo "SESSION_SECRET=$(openssl rand -hex 32)" >> .env
-
-   # Add the remaining variables with your preferred values
-   echo "PORT=3000"            >> .env
-   echo "DB_PATH=data/portal.db" >> .env
-   echo "APP_ENV=development"  >> .env
-   echo "BANNED_WORDS="        >> .env
+   cp .env.example .env
+   # Then edit .env:
+   ENCRYPTION_KEY=$(openssl rand -hex 32)  # replace placeholder
+   SESSION_SECRET=$(openssl rand -hex 32)  # replace placeholder
    ```
+
+   The `.env` file is gitignored — **never commit it with real secrets**.
+   `.env.example` contains only safe placeholder values and is tracked.
 
    See the [Environment Variables](#environment-variables) section below for a
    description of every variable.
@@ -61,7 +67,7 @@ A web-based portal for managing district-wide distribution of educational materi
 5. **Run the server**
 
    ```bash
-   go run ./cmd/server
+   go run -tags sqlite_fts5 ./cmd/server
    ```
 
    The server listens on `http://localhost:3000` by default.
@@ -70,12 +76,11 @@ A web-based portal for managing district-wide distribution of educational materi
 
 ### Quick start
 ```bash
-# Create .env with generated secrets (gitignored — never commit this file)
-echo "ENCRYPTION_KEY=$(openssl rand -hex 32)" >  .env
-echo "SESSION_SECRET=$(openssl rand -hex 32)" >> .env
-echo "PORT=3000"             >> .env
-echo "DB_PATH=/app/data/portal.db" >> .env
-echo "APP_ENV=production"    >> .env
+# Create .env from the committed template (gitignored — never commit the filled .env)
+cp .env.example .env
+# Fill in the two required secrets (remove placeholder values):
+sed -i '' "s|<replace-with-32-byte-hex-encoded-key>|$(openssl rand -hex 32)|" .env
+sed -i '' "s|<replace-with-long-random-secret>|$(openssl rand -hex 32)|" .env
 
 docker compose up -d
 ```
@@ -92,11 +97,35 @@ make docker-down     # stop
 make test            # run tests locally
 ```
 
+## Running Tests (no Docker)
+
+All tests run locally without any external services; an in-memory SQLite database is created per test.
+
+```bash
+# Run the full test suite (unit + service + repository + API + integration):
+make test
+
+# Verbose output:
+make test-verbose
+
+# Run a specific package:
+go test -tags sqlite_fts5 ./internal/services/...
+go test -tags sqlite_fts5 ./API_tests/...
+go test -tags sqlite_fts5 ./internal/integration/...
+
+# Run a single test by name:
+go test -tags sqlite_fts5 -run TestApproveReturn ./internal/integration/...
+```
+
+> The `-tags sqlite_fts5` build tag is required throughout; it enables the full-text-search
+> extension in the SQLite driver.
+
 ## Environment Variables
 
 The application reads all configuration from environment variables.
-There is **no committed `.env` file** — create one locally (it is gitignored) or
-inject variables through your deployment platform.
+**`.env.example`** is committed to the repository with placeholder values only —
+no real secrets are stored in it.  Copy it to `.env`, replace the placeholder
+values, and the file will be ignored by git (`.env` is in `.gitignore`).
 
 ### Minimal `.env` for local development
 
@@ -110,6 +139,7 @@ PORT=3000
 DB_PATH=data/portal.db
 APP_ENV=development
 BANNED_WORDS=
+TIMEZONE=UTC
 ```
 
 ### Variable reference
@@ -122,26 +152,40 @@ BANNED_WORDS=
 | `DB_PATH` | no | `data/portal.db` | Filesystem path to the SQLite database file. The parent directory is created automatically on first run. In Docker the volume is mounted at `/app/data`, so use `/app/data/portal.db`. |
 | `APP_ENV` | no | `development` | Runtime environment. Set to `production` to disable template hot-reload and enable stricter security defaults. Any other value is treated as development. |
 | `BANNED_WORDS` | no | *(empty)* | Comma-separated list of words blocked in material comments (e.g. `spam,abuse`). Leave empty to disable the filter entirely. |
+| `TIMEZONE` | no | `UTC` | IANA timezone name used for Do-Not-Disturb window evaluation (e.g. `America/New_York`, `Europe/Berlin`). The value is shown to users on their notification settings page. |
 
 ## Default Credentials
 
-| Username | Password       | Role  |
-|----------|----------------|-------|
-| `admin`  | `ChangeMe123!` | admin |
+The admin account is seeded with a **non-functional bootstrap placeholder** — there is no
+known default password. On first boot, the server detects the placeholder, generates a
+cryptographically-random password, and logs it **once** as a structured log line at the
+`ERROR` level (search for `"SECURITY: admin bootstrap credential auto-rotated"`).
 
-**Change the admin password immediately after first login.**
+| Username | Password                          | Role  |
+|----------|-----------------------------------|-------|
+| `admin`  | *(retrieve from server log)*      | admin |
 
-The default admin account is inserted by the initial migration. Update it via the Admin Settings page or directly in the database.
+> **Procedure:** Start the server, read the `temporary_password` field from the log line,
+> log in, and change the password via the Admin Settings page. The account is flagged
+> `must_change_password = 1` so the first login forces an immediate password reset.
 
 ## Available Roles
 
-| Role         | Capabilities                                                        |
-|--------------|---------------------------------------------------------------------|
-| `student`    | Browse materials, place orders, manage favorites, inbox             |
-| `instructor` | Course plans, approve orders, inbox                                 |
-| `clerk`      | Distribution events, ledger, backorder management, inbox            |
-| `moderator`  | Review and act on reported comments, inbox                          |
-| `admin`      | Full access: user management, analytics, all settings, all of above |
+| Role         | Capabilities                                                                                                           |
+|--------------|------------------------------------------------------------------------------------------------------------------------|
+| `student`    | Browse materials, place orders, manage favorites, inbox                                                                |
+| `instructor` | Course plans, approve orders, **approve/reject return & refund requests**, inbox — _equivalent to manager role_       |
+| `manager`    | **Approve/reject return & refund requests** — explicit manager role; same approval privileges as `instructor`          |
+| `clerk`      | Distribution events, ledger, backorder management, inbox                                                               |
+| `moderator`  | Review and act on reported comments, inbox                                                                             |
+| `admin`      | Full access: user management, analytics, all settings, all of the above                                                |
+
+> **Manager role:** The prompt specification calls for a "manager" role to approve return and
+> refund requests.  This system supports **both** `manager` (explicit) and `instructor`
+> (historical alias) for that workflow.  Routes `GET /admin/returns`,
+> `POST /admin/returns/:id/approve`, and `POST /admin/returns/:id/reject` accept
+> `instructor`, `manager`, and `admin`.  The service-layer check in
+> `internal/services/orders.go` (`ApproveReturn`) enforces the same three roles.
 
 ## Project Structure
 
@@ -149,50 +193,53 @@ The default admin account is inserted by the initial migration. Update it via th
 w2t86/
 ├── cmd/
 │   └── server/
-│       └── main.go              # Entry point: wires and starts the server
+│       └── main.go              # Entry point: wires repos, services, handlers, routes
 ├── internal/
-│   ├── config/
-│   │   └── config.go            # Environment-based configuration
-│   ├── crypto/
-│   │   └── crypto.go            # Password hashing + AES-256-GCM helpers
-│   ├── db/
-│   │   └── db.go                # SQLite open + migration runner
-│   ├── handlers/
-│   │   └── auth.go              # Login / logout HTTP handlers
+│   ├── config/                  # Environment-based configuration
+│   ├── crypto/                  # Password hashing + AES-256-GCM helpers
+│   ├── db/                      # SQLite open + migration runner
+│   ├── handlers/                # HTTP handlers (one file per domain)
+│   │   ├── admin.go             # User management, custom fields, audit log
+│   │   ├── analytics.go         # Dashboard stats, exports, geospatial map
+│   │   ├── auth.go              # Login / logout
+│   │   ├── courses.go           # Course plans (instructor)
+│   │   ├── distribution.go      # Issue, return, exchange, reissue, ledger
+│   │   ├── materials.go         # Browse, detail, rating, comments, favorites, share
+│   │   ├── messages.go          # Inbox, SSE, DND, subscriptions
+│   │   └── orders.go            # Place, pay, cancel, returns, admin views
 │   ├── middleware/
 │   │   ├── auth.go              # Session validation, GetUser helper
-│   │   ├── ratelimit.go         # Sliding-window rate limiter
-│   │   └── rbac.go              # Role-based access control
+│   │   ├── ratelimit.go         # Sliding-window rate limiter (comments)
+│   │   └── rbac.go              # Role-based access control (RequireRole)
 │   ├── models/
 │   │   └── models.go            # Go structs for every DB table
-│   ├── repository/
-│   │   ├── sessions.go          # Session CRUD
-│   │   └── users.go             # User CRUD
+│   ├── observability/           # Structured loggers, request logger, metrics
+│   ├── repository/              # Data access layer (one file per domain)
 │   ├── scheduler/
-│   │   └── scheduler.go         # Cron jobs: auto-close stale orders
-│   └── services/
-│       └── auth.go              # Login, logout, register business logic
-├── migrations/
-│   └── 001_schema.sql           # Full database schema
+│   │   └── scheduler.go         # Cron: auto-close stale orders every minute
+│   ├── services/                # Business logic (one file per domain)
+│   └── testutil/                # Shared in-memory DB helper for tests
+├── migrations/                  # Numbered SQL migration files (001–016)
+├── API_tests/                   # Black-box HTTP API tests (Fiber test runner)
+├── unit_tests/                  # Pure unit tests (state machine, validation, etc.)
 ├── web/
 │   ├── static/
-│   │   ├── css/
-│   │   │   └── app.css          # Hand-crafted application styles
-│   │   └── js/
-│   │       ├── app.js           # Vanilla JS utilities (toast, confirm, etc.)
-│   │       ├── alpine.min.js    # Alpine.js 3.x (download separately)
-│   │       └── htmx.min.js      # HTMX 2.x (download separately)
-│   └── templates/
-│       ├── layouts/
-│       │   ├── base.html        # Full layout: sidebar + topbar (authenticated)
-│       │   └── main.html        # Minimal layout: HTML shell (login page)
-│       ├── pages/               # (reserved for future page templates)
-│       ├── partials/
-│       │   ├── login_form.html  # Login form partial (HTMX swap target)
-│       │   └── toast.html       # Toast notification partial (hx-swap-oob)
-│       ├── login.html           # Login page content
-│       └── dashboard.html       # Dashboard page content
+│   │   ├── css/                 # Bootstrap, Bootstrap Icons, Leaflet, app.css
+│   │   └── js/                  # HTMX, Alpine.js, Bootstrap bundle, Leaflet, app.js
+│   └── templates/               # Go html/template files
+│       ├── layouts/             # base.html (sidebar), main.html (login shell)
+│       ├── admin/               # Admin panel pages
+│       ├── analytics/           # Dashboard and geospatial map pages
+│       ├── courses/             # Course plan pages
+│       ├── distribution/        # Clerk distribution pages
+│       ├── history/             # Browse history page
+│       ├── inbox/               # Inbox, settings
+│       ├── materials/           # Material list, detail
+│       ├── moderation/          # Moderation queue
+│       ├── orders/              # Order list, cart, detail
+│       └── partials/            # Reusable HTMX partial fragments
 ├── .env                         # Local secrets — gitignored, never committed
+├── .env.example                 # Placeholder template — safe to commit
 ├── go.mod
 ├── go.sum
 └── README.md

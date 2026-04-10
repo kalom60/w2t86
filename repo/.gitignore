@@ -6,6 +6,7 @@ data/
 
 # Environment secrets — never commit real credentials
 .env
+.env.example
 .env.local
 .env.*.local
 
@@ -27,3 +28,6 @@ web/static/tiles/**/*.png
 # OS artifacts
 .DS_Store
 Thumbs.db
+
+# claude
+.claude

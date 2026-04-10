@@ -24,19 +24,23 @@ func newTestDB(t *testing.T) *sql.DB {
 
 	schema := `
 		CREATE TABLE IF NOT EXISTS users (
-			id              INTEGER PRIMARY KEY,
-			username        TEXT    UNIQUE NOT NULL,
-			email           TEXT    NOT NULL,
-			password_hash   TEXT    NOT NULL,
-			role            TEXT    NOT NULL DEFAULT 'student',
-			failed_attempts INTEGER DEFAULT 0,
-			locked_until    TEXT,
-			date_of_birth   TEXT,
-			full_name       TEXT,
-			external_id     TEXT    UNIQUE,
-			created_at      TEXT    DEFAULT (datetime('now')),
-			updated_at      TEXT    DEFAULT (datetime('now')),
-			deleted_at      TEXT
+			id                   INTEGER PRIMARY KEY,
+			username             TEXT    UNIQUE NOT NULL,
+			email                TEXT    NOT NULL,
+			password_hash        TEXT    NOT NULL,
+			role                 TEXT    NOT NULL DEFAULT 'student',
+			failed_attempts      INTEGER DEFAULT 0,
+			locked_until         TEXT,
+			date_of_birth        TEXT,
+			full_name            TEXT,
+			full_name_idx        TEXT,
+			full_name_phonetic   TEXT,
+			external_id          TEXT    UNIQUE,
+			external_id_idx      TEXT,
+			created_at           TEXT    DEFAULT (datetime('now')),
+			updated_at           TEXT    DEFAULT (datetime('now')),
+			deleted_at           TEXT,
+			must_change_password INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS sessions (
 			id          INTEGER PRIMARY KEY,

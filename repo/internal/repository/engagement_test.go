@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -52,19 +53,24 @@ func TestEngagementRepository_RecordVisit_And_GetHistory(t *testing.T) {
 	}
 }
 
-func TestEngagementRepository_UpsertRating_ThenUpdate(t *testing.T) {
+func TestEngagementRepository_InsertRating_Once(t *testing.T) {
 	repo, db := newEngagementRepo(t)
 	userID, matID := engagementFixtures(t, db)
 
-	if err := repo.UpsertRating(matID, userID, 3); err != nil {
-		t.Fatalf("UpsertRating first: %v", err)
+	if err := repo.InsertRating(matID, userID, 3); err != nil {
+		t.Fatalf("InsertRating first: %v", err)
 	}
 
-	// Update to 5 stars
-	if err := repo.UpsertRating(matID, userID, 5); err != nil {
-		t.Fatalf("UpsertRating update: %v", err)
+	// Second attempt must return ErrAlreadyRated.
+	err := repo.InsertRating(matID, userID, 5)
+	if err == nil {
+		t.Fatal("expected ErrAlreadyRated on second rating, got nil")
+	}
+	if !errors.Is(err, repository.ErrAlreadyRated) {
+		t.Errorf("expected ErrAlreadyRated, got %v", err)
 	}
 
+	// Original rating must be unchanged.
 	rating, err := repo.GetRating(matID, userID)
 	if err != nil {
 		t.Fatalf("GetRating: %v", err)
@@ -72,8 +78,8 @@ func TestEngagementRepository_UpsertRating_ThenUpdate(t *testing.T) {
 	if rating == nil {
 		t.Fatal("expected rating, got nil")
 	}
-	if rating.Stars != 5 {
-		t.Errorf("expected 5 stars, got %d", rating.Stars)
+	if rating.Stars != 3 {
+		t.Errorf("expected stars=3 (original), got %d", rating.Stars)
 	}
 }
 
@@ -94,11 +100,11 @@ func TestEngagementRepository_GetAverageRating(t *testing.T) {
 	}
 	uid2, _ := r2.LastInsertId()
 
-	if err := repo.UpsertRating(matID, uid1, 4); err != nil {
-		t.Fatalf("UpsertRating uid1: %v", err)
+	if err := repo.InsertRating(matID, uid1, 4); err != nil {
+		t.Fatalf("InsertRating uid1: %v", err)
 	}
-	if err := repo.UpsertRating(matID, uid2, 2); err != nil {
-		t.Fatalf("UpsertRating uid2: %v", err)
+	if err := repo.InsertRating(matID, uid2, 2); err != nil {
+		t.Fatalf("InsertRating uid2: %v", err)
 	}
 
 	avg, count, err := repo.GetAverageRating(matID)
@@ -244,40 +250,30 @@ func TestEngagementRepository_CountRecentComments_RateLimit(t *testing.T) {
 	repo, db := newEngagementRepo(t)
 	userID, matID := engagementFixtures(t, db)
 
-	// Post 3 comments
+	// Post 3 comments right now.
 	for i := 0; i < 3; i++ {
 		if _, err := repo.CreateComment(matID, userID, "comment", 0); err != nil {
 			t.Fatalf("CreateComment %d: %v", i, err)
 		}
 	}
 
-	// CountRecentComments formats `since` as RFC3339 ("2006-01-02T15:04:05Z")
-	// while SQLite's datetime('now') stores "2006-01-02 15:04:05" (space
-	// separator, no Z suffix).  Because space (0x20) < 'T' (0x54), the RFC3339
-	// string always compares GREATER than the stored SQLite string for the same
-	// moment, making "ts >= RFC3339" always FALSE unless the RFC3339 date is
-	// strictly earlier as a string.
-	//
-	// To guarantee "ts >= since" is TRUE for recently inserted rows we use the
-	// zero time (year 0001) which is always earlier than any real timestamp,
-	// regardless of format.
-	since := time.Time{} // epoch zero — always before any real row
+	// A cutoff 5 minutes ago should see all 3 comments (they were just created).
+	since := time.Now().Add(-5 * time.Minute)
 	count, err := repo.CountRecentComments(userID, since)
 	if err != nil {
 		t.Fatalf("CountRecentComments: %v", err)
 	}
 	if count != 3 {
-		t.Errorf("expected 3 recent comments, got %d", count)
+		t.Errorf("expected 3 recent comments within 5-minute window, got %d", count)
 	}
 
-	// A since value far in the future (year 9999) is always greater than any
-	// stored timestamp and should yield zero results.
-	futureSince := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	// A cutoff in the future should yield zero results.
+	futureSince := time.Now().Add(1 * time.Minute)
 	count2, err := repo.CountRecentComments(userID, futureSince)
 	if err != nil {
 		t.Fatalf("CountRecentComments future: %v", err)
 	}
 	if count2 != 0 {
-		t.Errorf("expected 0 recent comments with future cutoff, got %d", count2)
+		t.Errorf("expected 0 comments with future cutoff, got %d", count2)
 	}
 }

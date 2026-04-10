@@ -33,7 +33,7 @@ func TestModerationDebug(t *testing.T) {
 	msgSvc := services.NewMessagingService(messagingRepo)
 	modHandler := handlers.NewModerationHandler(modSvc, msgSvc)
 	authHandler := handlers.NewAuthHandler(authSvc)
-	authMiddleware := middleware.NewAuthMiddleware(sessionRepo, userRepo)
+	authMiddleware := middleware.NewAuthMiddleware(sessionRepo, userRepo, cfg.SessionSecret)
 
 	engine := html.New("../../web/templates", ".html")
 	engine.AddFunc("mul", func(a, b float64) float64 { return a * b })

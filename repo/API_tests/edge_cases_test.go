@@ -115,8 +115,9 @@ func TestEdge_ReportComment_CollapseAt3(t *testing.T) {
 // Rating idempotency
 // ---------------------------------------------------------------------------
 
-// TestEdge_Rate_Duplicate_Upserts verifies the second rating upserts (no duplicate row).
-func TestEdge_Rate_Duplicate_Upserts(t *testing.T) {
+// TestEdge_Rate_Duplicate_Rejected verifies that a second rating by the same
+// user is rejected with 409 and that the original rating is preserved.
+func TestEdge_Rate_Duplicate_Rejected(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()
 
@@ -127,17 +128,23 @@ func TestEdge_Rate_Duplicate_Upserts(t *testing.T) {
 
 	r1 := makeRequest(app, http.MethodPost, path, "stars=3", cookie, ct)
 	_ = readBody(r1)
-	r2 := makeRequest(app, http.MethodPost, path, "stars=5", cookie, ct)
-	if r2.StatusCode != http.StatusOK && r2.StatusCode != http.StatusFound {
-		t.Fatalf("second rating returned %d", r2.StatusCode)
+	if r1.StatusCode != http.StatusOK && r1.StatusCode != http.StatusFound {
+		t.Fatalf("first rating returned %d", r1.StatusCode)
 	}
 
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM ratings WHERE material_id=?`, mat.ID).Scan(&count); err != nil {
-		t.Fatalf("count ratings: %v", err)
+	r2 := makeRequest(app, http.MethodPost, path, "stars=5", cookie, ct)
+	_ = readBody(r2)
+	if r2.StatusCode != http.StatusConflict {
+		t.Fatalf("second rating: expected 409 Conflict, got %d", r2.StatusCode)
 	}
-	if count != 1 {
-		t.Errorf("expected exactly 1 rating row after upsert, got %d", count)
+
+	// Original stars (3) must be unchanged.
+	var stars int
+	if err := db.QueryRow(`SELECT stars FROM ratings WHERE material_id=?`, mat.ID).Scan(&stars); err != nil {
+		t.Fatalf("read rating: %v", err)
+	}
+	if stars != 3 {
+		t.Errorf("expected original stars=3, got %d", stars)
 	}
 }
 

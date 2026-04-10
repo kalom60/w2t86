@@ -46,9 +46,8 @@
           hx-post="/inbox/{{.ID}}/read"
           hx-target="#inbox-badge"
           hx-swap="outerHTML"
-          hx-on::after-request="document.getElementById('notif-{{.ID}}').classList.remove('fw-semibold'); document.getElementById('notif-{{.ID}}').classList.add('text-muted')"
           hx-on::before-request="this.disabled=true"
-          hx-on::after-request="this.disabled=false">
+          hx-on::after-request="this.disabled=false; document.getElementById('notif-{{.ID}}').classList.remove('fw-semibold'); document.getElementById('notif-{{.ID}}').classList.add('text-muted')">
           <i class="bi bi-check2"></i> Mark Read
         </button>
         {{end}}

@@ -161,6 +161,9 @@ func (h *MaterialHandler) Rate(c *fiber.Ctx) error {
 	}
 
 	if err := h.materialService.Rate(int64(id), user.ID, stars); err != nil {
+		if errors.Is(err, repository.ErrAlreadyRated) {
+			return htmxErr(c, fiber.StatusConflict, "You have already rated this material")
+		}
 		return internalErr(c, observability.App, "rate material failed", err, "material_id", id, "user_id", user.ID)
 	}
 
@@ -613,6 +616,11 @@ func materialModelFromForm(c *fiber.Ctx) *models.Material {
 		ReservedQty:  0,
 		Status:       c.FormValue("status"),
 	}
+	if v := c.FormValue("price"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p >= 0 {
+			m.Price = p
+		}
+	}
 	if v := c.FormValue("isbn"); v != "" {
 		m.ISBN = &v
 	}
@@ -651,6 +659,11 @@ func materialFieldsFromForm(c *fiber.Ctx) map[string]interface{} {
 			if n, err := strconv.Atoi(v); err == nil {
 				fields[f] = n
 			}
+		}
+	}
+	if v := c.FormValue("price"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p >= 0 {
+			fields["price"] = p
 		}
 	}
 	return fields

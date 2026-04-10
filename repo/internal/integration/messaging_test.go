@@ -247,3 +247,27 @@ func TestInboxBadge(t *testing.T) {
 			resp.StatusCode, readBody(resp))
 	}
 }
+
+// TestInboxSettings_Renders verifies that GET /inbox/settings returns 200 and
+// that the rendered page contains the DND hour-selector options (validating the
+// hourRange template function contract: each option must expose .Val and .Label).
+func TestInboxSettings_Renders(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+
+	resp := makeRequest(app, http.MethodGet, "/inbox/settings", "", cookie, "", htmxHeaders())
+	body := readBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /inbox/settings: expected 200, got %d; body: %s", resp.StatusCode, body)
+	}
+	// Template iterates hourRange and renders <option value="{{$h.Val}}">{{$h.Label}}</option>.
+	// Spot-check a known value: hour 21 → value="21" and label "21:00".
+	if !strings.Contains(body, `value="21"`) {
+		t.Errorf("GET /inbox/settings: expected option value=21 in body")
+	}
+	if !strings.Contains(body, "21:00") {
+		t.Errorf("GET /inbox/settings: expected label '21:00' in body")
+	}
+}

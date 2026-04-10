@@ -1,18 +1,19 @@
 package crypto_test
 
-// admin_seed_test.go — verifies that the default admin password documented in
-// the README ("ChangeMe123!") successfully bcrypt-compares against the seeded
-// hash in migrations/001_schema.sql.
+// admin_seed_test.go — verifies that the default admin account seeded in
+// migrations/001_schema.sql uses a non-functional bootstrap placeholder (not a
+// known exploitable password) and that the auto-rotation mechanism produces a
+// valid bcrypt credential at cost 12.
 //
-// This test closes the "runtime verification required" audit gap by providing
-// automated, repeatable proof that the seed hash and the documented password
-// are in sync.  If someone changes the seed hash without updating the README
-// (or vice-versa) this test will fail.
+// The old approach seeded a known bcrypt hash for "ChangeMe123!" directly in
+// the migration, creating an exploitable window between deployment and first
+// login. The new approach seeds the sentinel string "BOOTSTRAP_PENDING_ROTATION"
+// which is NOT a valid bcrypt hash. On first boot, cmd/server/main.go detects
+// this sentinel, generates a random password, hashes it, and logs it once.
 
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -25,88 +26,65 @@ import (
 // directory from which `go test` is invoked.
 func schemaPath(t *testing.T) string {
 	t.Helper()
-	// runtime.Caller(0) gives the path of this source file at compile time.
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed — cannot determine source file path")
 	}
 	// thisFile: .../internal/crypto/admin_seed_test.go
-	// root:     .../
+	// root:     .../  (two directories up)
 	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	return filepath.Join(root, "migrations", "001_schema.sql")
 }
 
-// extractSeedHash reads migrations/001_schema.sql and returns the bcrypt hash
-// used in the admin seed INSERT statement.
-func extractSeedHash(t *testing.T) string {
-	t.Helper()
-
-	sqlFile := schemaPath(t)
-	content, err := os.ReadFile(sqlFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", sqlFile, err)
-	}
-
-	// Match the INSERT line for the admin seed row.
-	// Captures the bcrypt hash (3rd positional value) regardless of how many
-	// additional columns (e.g. full_name) follow it.
-	// Example:
-	//   VALUES('admin', 'admin@portal.local', '$2a$12$...', 'admin', 'System Administrator');
-	re := regexp.MustCompile(`VALUES\s*\(\s*'admin'\s*,\s*'[^']+'\s*,\s*'(\$2[aby]\$[^']+)'\s*,`)
-	m := re.FindStringSubmatch(string(content))
-	if len(m) < 2 {
-		t.Fatalf("could not find admin seed hash in %s — regex did not match", sqlFile)
-	}
-	return strings.TrimSpace(m[1])
-}
-
-// TestDefaultAdminPassword_MatchesSeedHash is the primary audit-driven test.
-// It reads the bcrypt hash from the migration file and confirms that the
-// documented default password produces a successful comparison.
+// TestDefaultAdminPassword_MatchesSeedHash verifies that the migration seeds
+// the admin account with the non-functional bootstrap placeholder rather than a
+// known exploitable bcrypt hash.
+//
+// PASS means: no freshly-seeded database accepts a documented default password
+// — login is blocked until the server's auto-rotation runs on first boot.
 func TestDefaultAdminPassword_MatchesSeedHash(t *testing.T) {
-	const (
-		// The default password documented in README.md and the startup warning
-		// in cmd/server/main.go.
-		documentedPassword = "ChangeMe123!"
+	data, err := os.ReadFile(schemaPath(t))
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	content := string(data)
 
-		// The hash hardcoded as a sentinel in cmd/server/main.go.
-		// Kept here as a belt-and-suspenders cross-check.
-		sentinelHash = "$2a$12$fMPISK6tAC1XLVM3JdJQDuB/CrXgdRM.LUPHHu4/VxS/vzihnYyQ."
-	)
-
-	seedHash := extractSeedHash(t)
-	t.Logf("seed hash from 001_schema.sql: %s", seedHash)
-
-	// 1. The hash extracted from the migration must match the sentinel used by
-	//    the startup warning — proves the three sources stay in sync.
-	if seedHash != sentinelHash {
-		t.Errorf("seed hash mismatch:\n  schema: %s\nsentinel: %s\nUpdate cmd/server/main.go to match.", seedHash, sentinelHash)
+	const placeholder = "BOOTSTRAP_PENDING_ROTATION"
+	if !strings.Contains(content, placeholder) {
+		t.Errorf("migrations/001_schema.sql must contain the bootstrap placeholder %q — found none\n"+
+			"This means a known credential is seeded, which is a security risk.", placeholder)
 	}
 
-	// 2. The documented password must successfully compare against the seed hash.
-	if !crypto.CheckPassword(seedHash, documentedPassword) {
-		t.Errorf("crypto.CheckPassword(%q, %q) = false; "+
-			"the documented password does not match the seeded hash — "+
-			"update README.md and/or migrations/001_schema.sql", seedHash, documentedPassword)
-	}
-
-	// 3. A wrong password must NOT match (sanity check for CheckPassword itself).
-	wrongPasswords := []string{"changeme123!", "ChangeMe123", "ChangeMe123!!", ""}
-	for _, bad := range wrongPasswords {
-		if crypto.CheckPassword(seedHash, bad) {
-			t.Errorf("crypto.CheckPassword unexpectedly accepted wrong password %q", bad)
-		}
+	// The legacy known hash must no longer appear.
+	const legacyHash = "$2a$12$fMPISK6tAC1XLVM3JdJQDuB/CrXgdRM.LUPHHu4/VxS/vzihnYyQ."
+	if strings.Contains(content, legacyHash) {
+		t.Errorf("migrations/001_schema.sql still contains the legacy known-default bcrypt hash.\n"+
+			"Replace it with the bootstrap placeholder %q.", placeholder)
 	}
 }
 
-// TestDefaultAdminPassword_SeedHashIsBcryptCost12 verifies the hash was
-// generated at bcrypt cost 12 (as required by the auth service).
+// TestDefaultAdminPassword_SeedHashIsBcryptCost12 verifies that the bootstrap
+// auto-rotation (GenerateRandomPassword + HashPassword) produces a bcrypt hash
+// at cost 12 — satisfying the password-hashing security policy.
 func TestDefaultAdminPassword_SeedHashIsBcryptCost12(t *testing.T) {
-	seedHash := extractSeedHash(t)
+	pass, err := crypto.GenerateRandomPassword()
+	if err != nil {
+		t.Fatalf("GenerateRandomPassword: %v", err)
+	}
 
-	// bcrypt hash format: $2a$<cost>$<salt+hash>
-	// Cost 12 → "$2a$12$"
-	if !strings.HasPrefix(seedHash, "$2a$12$") {
-		t.Errorf("seed hash does not use bcrypt cost 12: %s", seedHash)
+	hash, err := crypto.HashPassword(pass)
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+
+	// bcrypt hash format: $2a$<cost>$...
+	// HashPassword uses cost 12 → "$2a$12$"
+	if !strings.HasPrefix(hash, "$2a$12$") {
+		t.Errorf("HashPassword did not produce a bcrypt cost-12 hash: %s", hash)
+	}
+
+	// Round-trip must succeed.
+	if !crypto.CheckPassword(hash, pass) {
+		t.Error("CheckPassword returned false for a freshly generated password — rotation would produce an unusable credential")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"w2t86/internal/models"
@@ -25,43 +26,74 @@ func NewAdminRepository(db *sql.DB) *AdminRepository {
 // Custom fields
 // ---------------------------------------------------------------
 
-// SetCustomField upserts a custom field for the given user.
-func (r *AdminRepository) SetCustomField(userID int64, fieldName, fieldValue string, isEncrypted bool) error {
+// SetCustomField upserts a custom field for the given entity and writes an
+// immutable audit record capturing who changed the field, when, and why.
+// actorID is the ID of the admin performing the mutation; reason is mandatory.
+func (r *AdminRepository) SetCustomField(entityType string, entityID int64, fieldName, fieldValue string, isEncrypted bool, actorID int64, reason string) error {
 	enc := 0
 	if isEncrypted {
 		enc = 1
 	}
-	const q = `
-		INSERT INTO user_custom_fields (user_id, field_name, field_value, is_encrypted)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(user_id, field_name) DO UPDATE
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("repository: SetCustomField: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Read old value before the upsert for the audit trail.
+	var oldValue *string
+	var oldIsEncrypted int
+	readErr := tx.QueryRow(
+		`SELECT field_value, is_encrypted FROM entity_custom_fields WHERE entity_type = ? AND entity_id = ? AND field_name = ?`,
+		entityType, entityID, fieldName,
+	).Scan(&oldValue, &oldIsEncrypted)
+	if readErr != nil && readErr != sql.ErrNoRows {
+		return fmt.Errorf("repository: SetCustomField: read old value: %w", readErr)
+	}
+
+	const upsertQ = `
+		INSERT INTO entity_custom_fields (entity_type, entity_id, field_name, field_value, is_encrypted)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE
 		SET field_value  = excluded.field_value,
 		    is_encrypted = excluded.is_encrypted`
-	_, err := r.db.Exec(q, userID, fieldName, fieldValue, enc)
-	if err != nil {
-		return fmt.Errorf("repository: SetCustomField: %w", err)
+	if _, err := tx.Exec(upsertQ, entityType, entityID, fieldName, fieldValue, enc); err != nil {
+		return fmt.Errorf("repository: SetCustomField: upsert: %w", err)
+	}
+
+	const auditQ = `
+		INSERT INTO entity_custom_fields_audit
+		            (entity_type, entity_id, field_name, old_value, new_value, is_encrypted, actor_id, reason)
+		VALUES      (?, ?, ?, ?, ?, ?, ?, ?)`
+	if _, err := tx.Exec(auditQ, entityType, entityID, fieldName, oldValue, fieldValue, enc, actorID, reason); err != nil {
+		return fmt.Errorf("repository: SetCustomField: write audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("repository: SetCustomField: commit: %w", err)
 	}
 	return nil
 }
 
-// GetCustomFields returns all custom fields for a user.
-func (r *AdminRepository) GetCustomFields(userID int64) ([]models.UserCustomField, error) {
+// GetCustomFields returns all custom fields for the given entity.
+func (r *AdminRepository) GetCustomFields(entityType string, entityID int64) ([]models.EntityCustomField, error) {
 	const q = `
-		SELECT id, user_id, field_name, field_value, is_encrypted
-		FROM   user_custom_fields
-		WHERE  user_id = ?
+		SELECT id, entity_type, entity_id, field_name, field_value, is_encrypted
+		FROM   entity_custom_fields
+		WHERE  entity_type = ? AND entity_id = ?
 		ORDER  BY field_name`
 
-	rows, err := r.db.Query(q, userID)
+	rows, err := r.db.Query(q, entityType, entityID)
 	if err != nil {
 		return nil, fmt.Errorf("repository: GetCustomFields: %w", err)
 	}
 	defer rows.Close()
 
-	var out []models.UserCustomField
+	var out []models.EntityCustomField
 	for rows.Next() {
-		var f models.UserCustomField
-		if err := rows.Scan(&f.ID, &f.UserID, &f.FieldName, &f.FieldValue, &f.IsEncrypted); err != nil {
+		var f models.EntityCustomField
+		if err := rows.Scan(&f.ID, &f.EntityType, &f.EntityID, &f.FieldName, &f.FieldValue, &f.IsEncrypted); err != nil {
 			return nil, fmt.Errorf("repository: GetCustomFields: scan: %w", err)
 		}
 		out = append(out, f)
@@ -69,14 +101,108 @@ func (r *AdminRepository) GetCustomFields(userID int64) ([]models.UserCustomFiel
 	return out, rows.Err()
 }
 
-// DeleteCustomField removes a specific custom field for a user.
-func (r *AdminRepository) DeleteCustomField(userID int64, fieldName string) error {
-	const q = `DELETE FROM user_custom_fields WHERE user_id = ? AND field_name = ?`
-	_, err := r.db.Exec(q, userID, fieldName)
+// DeleteCustomField removes a specific custom field and writes an audit record.
+// actorID is the ID of the admin performing the deletion; reason is mandatory.
+func (r *AdminRepository) DeleteCustomField(entityType string, entityID int64, fieldName string, actorID int64, reason string) error {
+	tx, err := r.db.Begin()
 	if err != nil {
-		return fmt.Errorf("repository: DeleteCustomField: %w", err)
+		return fmt.Errorf("repository: DeleteCustomField: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Read old value for the audit trail before deleting.
+	var oldValue *string
+	var oldIsEncrypted int
+	readErr := tx.QueryRow(
+		`SELECT field_value, is_encrypted FROM entity_custom_fields WHERE entity_type = ? AND entity_id = ? AND field_name = ?`,
+		entityType, entityID, fieldName,
+	).Scan(&oldValue, &oldIsEncrypted)
+	if readErr != nil && readErr != sql.ErrNoRows {
+		return fmt.Errorf("repository: DeleteCustomField: read old value: %w", readErr)
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM entity_custom_fields WHERE entity_type = ? AND entity_id = ? AND field_name = ?`,
+		entityType, entityID, fieldName,
+	); err != nil {
+		return fmt.Errorf("repository: DeleteCustomField: delete: %w", err)
+	}
+
+	const auditQ = `
+		INSERT INTO entity_custom_fields_audit
+		            (entity_type, entity_id, field_name, old_value, new_value, is_encrypted, actor_id, reason)
+		VALUES      (?, ?, ?, ?, NULL, ?, ?, ?)`
+	if _, err := tx.Exec(auditQ, entityType, entityID, fieldName, oldValue, oldIsEncrypted, actorID, reason); err != nil {
+		return fmt.Errorf("repository: DeleteCustomField: write audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("repository: DeleteCustomField: commit: %w", err)
 	}
 	return nil
+}
+
+// GetCustomFieldAuditLog returns all audit entries for the given entity's custom
+// fields, ordered by most-recent first.
+func (r *AdminRepository) GetCustomFieldAuditLog(entityType string, entityID int64) ([]models.EntityCustomFieldAudit, error) {
+	const q = `
+		SELECT id, entity_type, entity_id, field_name,
+		       old_value, new_value, is_encrypted, actor_id, reason, changed_at
+		FROM   entity_custom_fields_audit
+		WHERE  entity_type = ? AND entity_id = ?
+		ORDER  BY changed_at DESC`
+
+	rows, err := r.db.Query(q, entityType, entityID)
+	if err != nil {
+		return nil, fmt.Errorf("repository: GetCustomFieldAuditLog: %w", err)
+	}
+	defer rows.Close()
+
+	var out []models.EntityCustomFieldAudit
+	for rows.Next() {
+		var a models.EntityCustomFieldAudit
+		if err := rows.Scan(
+			&a.ID, &a.EntityType, &a.EntityID, &a.FieldName,
+			&a.OldValue, &a.NewValue, &a.IsEncrypted, &a.ActorID, &a.Reason, &a.ChangedAt,
+		); err != nil {
+			return nil, fmt.Errorf("repository: GetCustomFieldAuditLog scan: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetEntityDisplayName returns a human-readable label for any supported entity
+// type by querying the authoritative name column for that table.
+//
+//   entity_type   table       column
+//   -----------   ---------   ------
+//   user          users       username
+//   material      materials   title
+//   course        courses     name
+//   location      locations   name
+//
+// Returns a safe fallback ("<type> #<id>") when the row is not found or the
+// type is not one of the four above, so callers never need to handle an error.
+func (r *AdminRepository) GetEntityDisplayName(entityType string, entityID int64) string {
+	var q string
+	switch entityType {
+	case "user":
+		q = `SELECT username FROM users WHERE id = ? AND deleted_at IS NULL`
+	case "material":
+		q = `SELECT title FROM materials WHERE id = ? AND deleted_at IS NULL`
+	case "course":
+		q = `SELECT name FROM courses WHERE id = ?`
+	case "location":
+		q = `SELECT name FROM locations WHERE id = ?`
+	default:
+		return entityType + " #" + strconv.FormatInt(entityID, 10)
+	}
+	var name string
+	if err := r.db.QueryRow(q, entityID).Scan(&name); err != nil {
+		return entityType + " #" + strconv.FormatInt(entityID, 10)
+	}
+	return name
 }
 
 // ---------------------------------------------------------------
@@ -133,18 +259,26 @@ type DuplicatePair struct {
 // name prefix; Go then applies the full composite formula.
 // Soft-deleted users are excluded. Results sorted by score desc, capped at limit.
 func (r *AdminRepository) FindDuplicateUsers(limit int) ([]DuplicatePair, error) {
-	// ---- Pass 1: exact ID — both accounts share the same non-null external_id ----
+	// ---- Pass 1: exact ID — both accounts share the same non-null external_id_idx ----
+	// Uses the HMAC blind index instead of the AES-GCM ciphertext.  Randomized
+	// GCM encryption produces a unique ciphertext on every call, so equality
+	// comparison on the raw external_id column would never match.  The blind index
+	// is deterministic: HMAC-SHA256(derived_key, plaintext), so SQL = works.
 	const exactQ = `
 		SELECT a.id, a.username, a.email, a.password_hash, a.role,
-		       a.failed_attempts, a.locked_until, a.date_of_birth, a.full_name, a.external_id,
-		       a.created_at, a.updated_at, a.deleted_at,
+		       a.failed_attempts, a.locked_until, a.date_of_birth,
+		       a.full_name, a.full_name_idx, a.full_name_phonetic,
+		       a.external_id, a.external_id_idx,
+		       a.created_at, a.updated_at, a.deleted_at, a.must_change_password,
 		       b.id, b.username, b.email, b.password_hash, b.role,
-		       b.failed_attempts, b.locked_until, b.date_of_birth, b.full_name, b.external_id,
-		       b.created_at, b.updated_at, b.deleted_at
+		       b.failed_attempts, b.locked_until, b.date_of_birth,
+		       b.full_name, b.full_name_idx, b.full_name_phonetic,
+		       b.external_id, b.external_id_idx,
+		       b.created_at, b.updated_at, b.deleted_at, b.must_change_password
 		FROM   users a
 		JOIN   users b ON b.id > a.id
-		             AND a.external_id IS NOT NULL
-		             AND a.external_id = b.external_id
+		             AND a.external_id_idx IS NOT NULL
+		             AND a.external_id_idx = b.external_id_idx
 		WHERE  a.deleted_at IS NULL AND b.deleted_at IS NULL
 		ORDER  BY a.id`
 
@@ -160,26 +294,34 @@ func (r *AdminRepository) FindDuplicateUsers(limit int) ([]DuplicatePair, error)
 		pairs[i].Score = 1.0
 	}
 
-	// ---- Pass 2: fuzzy — composite(name similarity + DOB) ----
-	// Excludes pairs already captured by Pass 1 (same external_id).
-	// COALESCE(full_name, username): use the real name when available.
+	// ---- Pass 2: fuzzy — DOB exact + name/phonetic blind-index equality ----
+	// Excludes pairs already matched in Pass 1 (same external_id_idx).
+	// SQL pre-filter uses three deterministic signals:
+	//   a) date_of_birth exact match,
+	//   b) full_name_idx equality (HMAC — same plaintext → same index), OR
+	//   c) full_name_phonetic equality (Soundex — similar-sounding names).
+	// Go-level scoring applies the composite formula.
 	const fuzzyQ = `
 		SELECT a.id, a.username, a.email, a.password_hash, a.role,
-		       a.failed_attempts, a.locked_until, a.date_of_birth, a.full_name, a.external_id,
-		       a.created_at, a.updated_at, a.deleted_at,
+		       a.failed_attempts, a.locked_until, a.date_of_birth,
+		       a.full_name, a.full_name_idx, a.full_name_phonetic,
+		       a.external_id, a.external_id_idx,
+		       a.created_at, a.updated_at, a.deleted_at, a.must_change_password,
 		       b.id, b.username, b.email, b.password_hash, b.role,
-		       b.failed_attempts, b.locked_until, b.date_of_birth, b.full_name, b.external_id,
-		       b.created_at, b.updated_at, b.deleted_at
+		       b.failed_attempts, b.locked_until, b.date_of_birth,
+		       b.full_name, b.full_name_idx, b.full_name_phonetic,
+		       b.external_id, b.external_id_idx,
+		       b.created_at, b.updated_at, b.deleted_at, b.must_change_password
 		FROM   users a
 		JOIN   users b ON b.id > a.id
-		             AND (a.external_id IS NULL OR b.external_id IS NULL
-		                  OR a.external_id != b.external_id)
+		             AND (a.external_id_idx IS NULL OR b.external_id_idx IS NULL
+		                  OR a.external_id_idx != b.external_id_idx)
 		WHERE  a.deleted_at IS NULL
 		  AND  b.deleted_at IS NULL
 		  AND (
 		        (a.date_of_birth IS NOT NULL AND a.date_of_birth = b.date_of_birth)
-		        OR LOWER(SUBSTR(COALESCE(a.full_name, a.username), 1, 4))
-		         = LOWER(SUBSTR(COALESCE(b.full_name, b.username), 1, 4))
+		        OR (a.full_name_idx IS NOT NULL AND a.full_name_idx = b.full_name_idx)
+		        OR (a.full_name_phonetic IS NOT NULL AND a.full_name_phonetic = b.full_name_phonetic)
 		      )
 		ORDER  BY a.id`
 
@@ -192,26 +334,30 @@ func (r *AdminRepository) FindDuplicateUsers(limit int) ([]DuplicatePair, error)
 		return nil, fmt.Errorf("repository: FindDuplicateUsers (fuzzy scan): %w", err)
 	}
 
-	// Score each candidate: score = nameWeight×name_similarity + dobWeight×dob_match
-	// "name" = full_name when set; falls back to username when full_name is NULL.
-	// "dob"  = date_of_birth exact match.
+	// Score each candidate:
+	//   nameSim: 1.0  — blind-index match (identical plaintext)
+	//            0.8  — phonetic (Soundex) match (similar-sounding names)
+	//            Levenshtein on username as a fallback (no full_name on either account)
+	//   dobMatch: 1.0 when both rows carry the same non-null date_of_birth.
 	const (
-		nameWeight = 0.6 // weight for name (full_name / username) similarity
-		dobWeight  = 0.4 // weight for date-of-birth exact match
+		nameWeight = 0.6
+		dobWeight  = 0.4
 		minScore   = 0.65
 	)
 	for _, p := range candidates {
-		// Resolve the name field: prefer full_name, fall back to username.
-		nameA := p.UserA.Username
-		if p.UserA.FullName != nil && *p.UserA.FullName != "" {
-			nameA = *p.UserA.FullName
+		var nameSim float64
+		if p.UserA.FullNameIdx != nil && p.UserB.FullNameIdx != nil &&
+			*p.UserA.FullNameIdx != "" && *p.UserA.FullNameIdx == *p.UserB.FullNameIdx {
+			// Deterministic HMAC equality → plaintext names are identical.
+			nameSim = 1.0
+		} else if p.UserA.FullNamePhonetic != nil && p.UserB.FullNamePhonetic != nil &&
+			*p.UserA.FullNamePhonetic != "" && *p.UserA.FullNamePhonetic == *p.UserB.FullNamePhonetic {
+			// Same Soundex code → similar-sounding names (e.g. "Smith" / "Smyth").
+			nameSim = 0.8
+		} else if p.UserA.FullName == nil && p.UserB.FullName == nil {
+			// Neither account has a full_name: fall back to username similarity.
+			nameSim = usernameSimilarity(p.UserA.Username, p.UserB.Username)
 		}
-		nameB := p.UserB.Username
-		if p.UserB.FullName != nil && *p.UserB.FullName != "" {
-			nameB = *p.UserB.FullName
-		}
-		// name_similarity: Levenshtein ratio on the resolved name (case-insensitive).
-		nameSim := usernameSimilarity(nameA, nameB)
 		// dob_match: 1.0 when both users share an identical, non-null birth date.
 		var dobMatch float64
 		if p.UserA.DateOfBirth != nil && p.UserB.DateOfBirth != nil &&
@@ -237,8 +383,8 @@ func (r *AdminRepository) FindDuplicateUsers(limit int) ([]DuplicatePair, error)
 // Duplicate-detection helpers
 // ---------------------------------------------------------------
 
-// scanUserPairs scans rows produced by a self-join query that returns two
-// consecutive user column sets (without a score column).
+// scanUserPairs scans rows produced by the self-join queries in FindDuplicateUsers.
+// Column order must match the SELECT lists in exactQ and fuzzyQ exactly.
 func scanUserPairs(rows *sql.Rows) ([]DuplicatePair, error) {
 	defer rows.Close()
 	var pairs []DuplicatePair
@@ -247,11 +393,15 @@ func scanUserPairs(rows *sql.Rows) ([]DuplicatePair, error) {
 		a, b := &p.UserA, &p.UserB
 		if err := rows.Scan(
 			&a.ID, &a.Username, &a.Email, &a.PasswordHash, &a.Role,
-			&a.FailedAttempts, &a.LockedUntil, &a.DateOfBirth, &a.FullName, &a.ExternalID,
-			&a.CreatedAt, &a.UpdatedAt, &a.DeletedAt,
+			&a.FailedAttempts, &a.LockedUntil, &a.DateOfBirth,
+			&a.FullName, &a.FullNameIdx, &a.FullNamePhonetic,
+			&a.ExternalID, &a.ExternalIDIdx,
+			&a.CreatedAt, &a.UpdatedAt, &a.DeletedAt, &a.MustChangePassword,
 			&b.ID, &b.Username, &b.Email, &b.PasswordHash, &b.Role,
-			&b.FailedAttempts, &b.LockedUntil, &b.DateOfBirth, &b.FullName, &b.ExternalID,
-			&b.CreatedAt, &b.UpdatedAt, &b.DeletedAt,
+			&b.FailedAttempts, &b.LockedUntil, &b.DateOfBirth,
+			&b.FullName, &b.FullNameIdx, &b.FullNamePhonetic,
+			&b.ExternalID, &b.ExternalIDIdx,
+			&b.CreatedAt, &b.UpdatedAt, &b.DeletedAt, &b.MustChangePassword,
 		); err != nil {
 			return nil, err
 		}
@@ -510,6 +660,7 @@ func (r *AdminRepository) GetRecentAuditLog(limit int) ([]models.AuditLog, error
 // ---------------------------------------------------------------
 
 // ListUsers returns paginated users, optionally filtered by role.
+// The SELECT uses the canonical userCols order to match scanUserRow exactly.
 func (r *AdminRepository) ListUsers(role string, limit, offset int) ([]models.User, error) {
 	args := []interface{}{}
 	where := "deleted_at IS NULL"
@@ -517,10 +668,7 @@ func (r *AdminRepository) ListUsers(role string, limit, offset int) ([]models.Us
 		where += " AND role = ?"
 		args = append(args, role)
 	}
-	q := `
-		SELECT id, username, email, password_hash, role,
-		       failed_attempts, locked_until, date_of_birth, full_name, external_id,
-		       created_at, updated_at, deleted_at
+	q := `SELECT ` + userCols + `
 		FROM   users
 		WHERE  ` + where + `
 		ORDER  BY id

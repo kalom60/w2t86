@@ -3,6 +3,7 @@ package integration_test
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"w2t86/internal/repository"
@@ -70,13 +71,14 @@ func TestApproveComment(t *testing.T) {
 			resp.StatusCode, readBody(resp))
 	}
 
-	// Verify DB.
+	// Verify DB: approved comment returns to 'visible' (not 'active') so the
+	// auto-collapse cycle continues to work if the comment is re-reported.
 	var status string
 	if err := db.QueryRow(`SELECT status FROM comments WHERE id = ?`, comment.ID).Scan(&status); err != nil {
 		t.Fatalf("query comment: %v", err)
 	}
-	if status != "active" {
-		t.Errorf("expected comment status 'active' after approve, got %q", status)
+	if status != "visible" {
+		t.Errorf("expected comment status 'visible' after approve, got %q", status)
 	}
 }
 
@@ -118,8 +120,110 @@ func TestRemoveComment(t *testing.T) {
 	}
 }
 
-// TestApproveComment_WrongStatus verifies that approving an already-active
-// comment returns 422 (the repository enforces status='collapsed').
+// TestCollapsedComment_HiddenFromNonModerator verifies that a comment in
+// 'collapsed' state is not returned to regular users (students/instructors).
+// Only admins and moderators may see collapsed content.
+func TestCollapsedComment_HiddenFromNonModerator(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	author := createTestUser(t, db, "student")
+	mat := createTestMaterial(t, db)
+
+	engRepo := repository.NewEngagementRepository(db)
+	comment, err := engRepo.CreateComment(mat.ID, author.ID, "Collapsed content", 0)
+	if err != nil {
+		t.Fatalf("create comment: %v", err)
+	}
+	// Collapse the comment directly (simulates hitting the 3-report threshold).
+	if _, err := db.Exec(`UPDATE comments SET status = 'collapsed' WHERE id = ?`, comment.ID); err != nil {
+		t.Fatalf("collapse comment: %v", err)
+	}
+
+	// Student requesting the material detail page must NOT see the collapsed comment.
+	studentCookie := loginAs(t, app, db, "student")
+	resp := makeRequest(app, http.MethodGet,
+		fmt.Sprintf("/materials/%d", mat.ID), "", studentCookie, "")
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on material detail, got %d", resp.StatusCode)
+	}
+	body := readBody(resp)
+	if strings.Contains(body, "Collapsed content") {
+		t.Error("collapsed comment body was visible to a non-moderator student — visibility leak")
+	}
+
+	// Moderator requesting the same page MUST see the collapsed comment.
+	modCookie := loginAs(t, app, db, "moderator")
+	resp2 := makeRequest(app, http.MethodGet,
+		fmt.Sprintf("/materials/%d", mat.ID), "", modCookie, "")
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for moderator on material detail, got %d", resp2.StatusCode)
+	}
+	body2 := readBody(resp2)
+	if !strings.Contains(body2, "Collapsed content") {
+		t.Error("collapsed comment was hidden from a moderator — moderators must see all comments")
+	}
+}
+
+// TestModeration_ReCollapseAfterApproval verifies the full approve → re-report →
+// re-collapse cycle works.  If ApproveComment sets 'active' instead of 'visible',
+// the auto-collapse predicate (status='visible') silently fails and the comment
+// can never be auto-collapsed again.
+func TestModeration_ReCollapseAfterApproval(t *testing.T) {
+	_, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	author := createTestUser(t, db, "student")
+	mat := createTestMaterial(t, db)
+
+	engRepo := repository.NewEngagementRepository(db)
+	modRepo := repository.NewModerationRepository(db)
+
+	// Create and collapse the comment.
+	comment, err := engRepo.CreateComment(mat.ID, author.ID, "Borderline comment", 0)
+	if err != nil {
+		t.Fatalf("create comment: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE comments SET status = 'collapsed' WHERE id = ?`, comment.ID); err != nil {
+		t.Fatalf("collapse comment: %v", err)
+	}
+
+	// Moderator approves → must return to 'visible'.
+	if err := modRepo.ApproveComment(comment.ID, author.ID); err != nil {
+		t.Fatalf("ApproveComment: %v", err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM comments WHERE id = ?`, comment.ID).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != "visible" {
+		t.Fatalf("expected 'visible' after approve, got %q — re-collapse cycle broken", status)
+	}
+
+	// Three new reporters → auto-collapse must work again.
+	reporters := []int64{}
+	for i := 0; i < 3; i++ {
+		u := createTestUser(t, db, "student")
+		reporters = append(reporters, u.ID)
+	}
+	for _, rid := range reporters {
+		if err := engRepo.ReportComment(comment.ID, rid, "inappropriate"); err != nil {
+			t.Fatalf("ReportComment: %v", err)
+		}
+	}
+
+	if err := db.QueryRow(`SELECT status FROM comments WHERE id = ?`, comment.ID).Scan(&status); err != nil {
+		t.Fatalf("query status after re-report: %v", err)
+	}
+	if status != "collapsed" {
+		t.Errorf("expected 'collapsed' after 3 new reports on previously-approved comment, got %q", status)
+	}
+}
+
+// TestApproveComment_WrongStatus verifies that approving a comment that is not
+// in 'collapsed' state returns 422 (the repository enforces status='collapsed').
 func TestApproveComment_WrongStatus(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()

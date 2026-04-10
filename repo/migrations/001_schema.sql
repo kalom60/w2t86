@@ -329,6 +329,39 @@ CREATE TABLE IF NOT EXISTS financial_transactions (
 );
 
 -- -------------------------------------------------------
+-- Spatial R*Tree index (bounding-box pre-filter for PiP)
+-- -------------------------------------------------------
+
+CREATE VIRTUAL TABLE IF NOT EXISTS location_rtree USING rtree(
+    id,
+    minX, maxX,   -- longitude range
+    minY, maxY    -- latitude range
+);
+
+CREATE TRIGGER IF NOT EXISTS location_rtree_ai
+AFTER INSERT ON locations
+WHEN new.lat IS NOT NULL AND new.lng IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO location_rtree (id, minX, maxX, minY, maxY)
+    VALUES (new.id, new.lng, new.lng, new.lat, new.lat);
+END;
+
+CREATE TRIGGER IF NOT EXISTS location_rtree_au
+AFTER UPDATE OF lat, lng ON locations
+BEGIN
+    DELETE FROM location_rtree WHERE id = old.id;
+    INSERT OR IGNORE INTO location_rtree (id, minX, maxX, minY, maxY)
+    SELECT new.id, new.lng, new.lng, new.lat, new.lat
+    WHERE  new.lat IS NOT NULL AND new.lng IS NOT NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS location_rtree_ad
+AFTER DELETE ON locations
+BEGIN
+    DELETE FROM location_rtree WHERE id = old.id;
+END;
+
+-- -------------------------------------------------------
 -- Indexes
 -- -------------------------------------------------------
 
@@ -345,7 +378,11 @@ CREATE INDEX IF NOT EXISTS idx_financial_txn_return ON financial_transactions(re
 -- Seed data
 -- -------------------------------------------------------
 
--- Default admin account.  Initial password is 'ChangeMe123!'.
--- IMPORTANT: change this password immediately after first login.
+-- Default admin account.
+-- The password_hash is a non-functional bootstrap placeholder — it is NOT a
+-- valid bcrypt hash and login will fail until the server auto-rotates it to a
+-- random credential on first boot (see cmd/server/main.go bootstrap logic).
+-- The temporary password is printed once to the server log; retrieve it there.
+-- must_change_password is set to 1 by migration 009 once that column exists.
 INSERT OR IGNORE INTO users(username, email, password_hash, role)
-VALUES('admin', 'admin@portal.local', '$2a$12$fMPISK6tAC1XLVM3JdJQDuB/CrXgdRM.LUPHHu4/VxS/vzihnYyQ.', 'admin');
+VALUES('admin', 'admin@portal.local', 'BOOTSTRAP_PENDING_ROTATION', 'admin');

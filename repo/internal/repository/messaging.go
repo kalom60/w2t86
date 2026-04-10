@@ -11,12 +11,25 @@ import (
 // MessagingRepository provides database operations for notifications,
 // DND settings, and topic subscriptions.
 type MessagingRepository struct {
-	db *sql.DB
+	db  *sql.DB
+	loc *time.Location // timezone used for DND hour evaluation; defaults to UTC
 }
 
 // NewMessagingRepository returns a MessagingRepository backed by the given database.
+// DND hours are evaluated in UTC by default; call SetTimezone to change this.
 func NewMessagingRepository(db *sql.DB) *MessagingRepository {
-	return &MessagingRepository{db: db}
+	return &MessagingRepository{db: db, loc: time.UTC}
+}
+
+// SetTimezone configures the timezone used when evaluating DND windows.
+// loc must be a valid IANA location (e.g. time.UTC, time.Local, or a location
+// loaded with time.LoadLocation).  Passing nil resets to UTC.
+func (r *MessagingRepository) SetTimezone(loc *time.Location) {
+	if loc == nil {
+		r.loc = time.UTC
+	} else {
+		r.loc = loc
+	}
 }
 
 // ---------------------------------------------------------------
@@ -162,27 +175,43 @@ func (r *MessagingRepository) SetDND(userID int64, startHour, endHour int) error
 	return nil
 }
 
-// IsInDND reports whether the current UTC hour falls within the user's DND window.
+// IsInDND reports whether the current hour (in the repository's configured timezone)
+// falls within the user's DND window.
 // Handles the wrap-around case (e.g. start=21, end=7 means 21:00–06:59 next day).
+// When no DND row exists the default quiet-hours window 21:00–07:00 is applied in
+// the configured timezone, ensuring new users receive protection without explicit
+// configuration. Setting start == end disables DND entirely.
+// The timezone defaults to UTC; change it with SetTimezone.
 func (r *MessagingRepository) IsInDND(userID int64) (bool, error) {
 	dnd, err := r.GetDND(userID)
 	if err != nil {
 		return false, err
 	}
+
+	var start, end int
 	if dnd == nil {
+		// Default quiet-hours window: 21:00–07:00 in the configured timezone.
+		start, end = 21, 7
+	} else {
+		start, end = dnd.StartHour, dnd.EndHour
+	}
+
+	// start == end means DND is disabled.
+	if start == end {
 		return false, nil
 	}
 
-	currentHour := time.Now().UTC().Hour()
-	start := dnd.StartHour
-	end := dnd.EndHour
-
+	loc := r.loc
+	if loc == nil {
+		loc = time.UTC
+	}
+	currentHour := time.Now().In(loc).Hour()
 	var inWindow bool
 	if start < end {
-		// Normal window, e.g. 9AM–5PM: current >= start AND current < end
+		// Normal window, e.g. 09:00–17:00: current >= start AND current < end
 		inWindow = currentHour >= start && currentHour < end
 	} else {
-		// Wrap-around window, e.g. 9PM–7AM: current >= start OR current < end
+		// Wrap-around window, e.g. 21:00–07:00: current >= start OR current < end
 		inWindow = currentHour >= start || currentHour < end
 	}
 	return inWindow, nil
@@ -231,15 +260,32 @@ func (r *MessagingRepository) Subscribe(userID int64, topic string) error {
 	return nil
 }
 
-// Unsubscribe sets active=0 for the given user+topic subscription.
+// Unsubscribe upserts an active=0 row for the given user+topic so that
+// IsSubscribedToTopic will return false even when no prior subscription existed.
 func (r *MessagingRepository) Unsubscribe(userID int64, topic string) error {
 	const q = `
-		UPDATE subscriptions
-		SET    active = 0
-		WHERE  user_id = ? AND topic = ?`
+		INSERT INTO subscriptions (user_id, topic, active)
+		VALUES (?, ?, 0)
+		ON CONFLICT(user_id, topic) DO UPDATE SET active = 0`
 
 	if _, err := r.db.Exec(q, userID, topic); err != nil {
 		return fmt.Errorf("repository: MessagingRepository.Unsubscribe: %w", err)
 	}
 	return nil
+}
+
+// IsSubscribedToTopic reports whether userID is subscribed to the given topic.
+// Returns true (the default opt-in policy) when no subscription record exists.
+// Returns false only when an explicit active=0 record exists (user has opted out).
+func (r *MessagingRepository) IsSubscribedToTopic(userID int64, topic string) (bool, error) {
+	const q = `SELECT active FROM subscriptions WHERE user_id = ? AND topic = ?`
+	var active int
+	err := r.db.QueryRow(q, userID, topic).Scan(&active)
+	if err == sql.ErrNoRows {
+		return true, nil // no record → default subscribed
+	}
+	if err != nil {
+		return false, fmt.Errorf("repository: MessagingRepository.IsSubscribedToTopic: %w", err)
+	}
+	return active == 1, nil
 }

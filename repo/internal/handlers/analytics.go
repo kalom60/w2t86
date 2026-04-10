@@ -141,6 +141,128 @@ func (h *AnalyticsHandler) ComputeGrid(c *fiber.Ctx) error {
 }
 
 // ---------------------------------------------------------------
+// Extended spatial routes
+// ---------------------------------------------------------------
+
+// BufferQuery handles GET /analytics/map/buffer
+// Returns locations within a radius of a given lat/lng centre point.
+// Query params: lat, lng, radius_km (default 10), layer (optional type filter).
+func (h *AnalyticsHandler) BufferQuery(c *fiber.Ctx) error {
+	var lat, lng, radiusKm float64
+	if _, err := fmt.Sscanf(c.Query("lat", "0"), "%f", &lat); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid lat"})
+	}
+	if _, err := fmt.Sscanf(c.Query("lng", "0"), "%f", &lng); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid lng"})
+	}
+	if _, err := fmt.Sscanf(c.Query("radius_km", "10"), "%f", &radiusKm); err != nil || radiusKm <= 0 {
+		radiusKm = 10
+	}
+	locType := c.Query("layer", "")
+
+	locs, err := h.analyticsService.LocationsWithinRadius(lat, lng, radiusKm, locType)
+	if err != nil {
+		observability.App.Error("buffer query failed", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(APIError{
+			Code: fiber.StatusInternalServerError,
+			Msg:  "An unexpected error occurred. Please try again.",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"center":    fiber.Map{"lat": lat, "lng": lng},
+		"radius_km": radiusKm,
+		"count":     len(locs),
+		"locations": locs,
+	})
+}
+
+// POIDensity handles GET /analytics/map/poi-density
+// Returns a per-type count of locations within a radius.
+// Query params: lat, lng, radius_km (default 10).
+func (h *AnalyticsHandler) POIDensity(c *fiber.Ctx) error {
+	var lat, lng, radiusKm float64
+	if _, err := fmt.Sscanf(c.Query("lat", "0"), "%f", &lat); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid lat"})
+	}
+	if _, err := fmt.Sscanf(c.Query("lng", "0"), "%f", &lng); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid lng"})
+	}
+	if _, err := fmt.Sscanf(c.Query("radius_km", "10"), "%f", &radiusKm); err != nil || radiusKm <= 0 {
+		radiusKm = 10
+	}
+
+	density, err := h.analyticsService.POIDensityWithinRadius(lat, lng, radiusKm)
+	if err != nil {
+		observability.App.Error("POI density failed", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(APIError{
+			Code: fiber.StatusInternalServerError,
+			Msg:  "An unexpected error occurred. Please try again.",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"center":    fiber.Map{"lat": lat, "lng": lng},
+		"radius_km": radiusKm,
+		"density":   density,
+	})
+}
+
+// Trajectory handles GET /analytics/map/trajectory/:materialID
+// Returns the ordered custody-chain scan events for a material.
+func (h *AnalyticsHandler) Trajectory(c *fiber.Ctx) error {
+	materialID, err := c.ParamsInt("materialID")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid material ID"})
+	}
+
+	pts, err := h.analyticsService.TrajectoryPoints(int64(materialID))
+	if err != nil {
+		observability.App.Error("trajectory query failed", "error", err, "material_id", materialID)
+		return c.Status(fiber.StatusInternalServerError).JSON(APIError{
+			Code: fiber.StatusInternalServerError,
+			Msg:  "An unexpected error occurred. Please try again.",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"material_id": materialID,
+		"points":      pts,
+	})
+}
+
+// RegionAggregate handles GET /analytics/map/regions
+// Returns order/scan counts aggregated by admin-region location.
+func (h *AnalyticsHandler) RegionAggregate(c *fiber.Ctx) error {
+	stats, err := h.analyticsService.RegionStats()
+	if err != nil {
+		observability.App.Error("region aggregate failed", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(APIError{
+			Code: fiber.StatusInternalServerError,
+			Msg:  "An unexpected error occurred. Please try again.",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"regions": stats,
+	})
+}
+
+// ComputeRegions handles POST /analytics/map/regions/compute
+// Recomputes spatial aggregates for admin regions.
+func (h *AnalyticsHandler) ComputeRegions(c *fiber.Ctx) error {
+	metric := c.FormValue("metric", "count")
+	if err := h.analyticsService.ComputeRegionAggregation(metric); err != nil {
+		observability.App.Error("compute region aggregation failed", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(APIError{
+			Code: fiber.StatusInternalServerError,
+			Msg:  "An unexpected error occurred. Please try again.",
+		})
+	}
+	return c.JSON(fiber.Map{"status": "ok"})
+}
+
+// ---------------------------------------------------------------
 // Export routes
 // ---------------------------------------------------------------
 
@@ -198,10 +320,15 @@ func (h *AnalyticsHandler) ExportDistribution(c *fiber.Ctx) error {
 // adminOnlyStats is the set of stat names that expose sensitive business metrics
 // and must only be served to admin-role users.
 var adminOnlyStats = map[string]bool{
-	"total-orders":    true,
-	"active-users":    true,
-	"conversion-rate": true,
-	"repeat-purchase": true,
+	"total-orders":     true,
+	"active-users":     true,
+	"conversion-rate":  true,
+	"repeat-purchase":  true,
+	"pending-issues":   true, // clerk/admin operational data
+	"backorders":       true, // clerk/admin operational data
+	"moderation-queue": true, // moderator/admin internal queue
+	"course-plans":     true, // instructor/admin data
+	"pending-returns":  true, // instructor/admin data
 }
 
 // DashboardStat handles GET /api/stats/:stat — returns a card-body HTML

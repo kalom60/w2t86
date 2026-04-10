@@ -1,6 +1,7 @@
 package unit_tests
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -32,11 +33,13 @@ func registerUser(t *testing.T, svc *services.AuthService, username, password st
 	}
 }
 
-// hashTokenForTest replicates the internal hashToken logic so we can query
-// sessions directly without exposing the function from the services package.
-func hashTokenForTest(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+// hashTokenForTest replicates the internal HMAC-SHA256 hashToken logic so we
+// can query sessions directly without exposing the function from the services
+// package. secret must match the SessionSecret used by the AuthService under test.
+func hashTokenForTest(secret, token string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func TestAuth_Register_MinPasswordLength_Exactly12_Passes(t *testing.T) {
@@ -220,7 +223,8 @@ func TestAuth_Logout_InvalidatesSession(t *testing.T) {
 	}
 
 	// Verify the session row is gone by looking up the token hash.
-	tokenHash := hashTokenForTest(token)
+	// The test AuthService uses cfg.SessionSecret="" (empty string).
+	tokenHash := hashTokenForTest("", token)
 	var count int
 	if err := db.QueryRow(
 		`SELECT COUNT(*) FROM sessions WHERE token_hash = ?`, tokenHash,
@@ -264,7 +268,7 @@ func TestAuth_Session_Expiry_StillValid(t *testing.T) {
 	}
 
 	// The session was just created — should still be present and valid (within 24h).
-	tokenHash := hashTokenForTest(token)
+	tokenHash := hashTokenForTest("", token)
 	var count int
 	if err := db.QueryRow(
 		`SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND expires_at > datetime('now')`,
@@ -275,5 +279,58 @@ func TestAuth_Session_Expiry_StillValid(t *testing.T) {
 	if count == 0 {
 		t.Errorf("expected a valid session within 24h for token starting %q, but none found",
 			fmt.Sprintf("%.8s…", token))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session tamper-detection: HMAC key separation
+// ---------------------------------------------------------------------------
+
+// TestAuth_SessionHash_DependsOnSecret verifies that the token hash stored in
+// the sessions table is HMAC-keyed with SESSION_SECRET, not a bare SHA-256.
+// A hash computed with a different secret must not match any DB row, so an
+// attacker who knows the raw token but not the secret cannot construct a valid
+// session hash.
+func TestAuth_SessionHash_DependsOnSecret(t *testing.T) {
+	const correctSecret = "correct-session-secret-for-test"
+	const wrongSecret   = "attacker-does-not-know-real-secret"
+
+	db := testutil.NewTestDB(t)
+	userRepo    := repository.NewUserRepository(db)
+	sessionRepo := repository.NewSessionRepository(db)
+	cfg         := &config.Config{SessionSecret: correctSecret}
+	svc         := services.NewAuthService(userRepo, sessionRepo, cfg)
+
+	if _, err := svc.Register("hmacuser", "hmac@x.com", "password12345", "student"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	token, _, err := svc.Login("hmacuser", "password12345")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// A hash computed with the WRONG secret must not find the session.
+	wrongHash := hashTokenForTest(wrongSecret, token)
+	var wrongCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE token_hash = ?`, wrongHash,
+	).Scan(&wrongCount); err != nil {
+		t.Fatalf("count (wrong secret): %v", err)
+	}
+	if wrongCount != 0 {
+		t.Error("session was found using a hash computed with the WRONG secret — HMAC key is not enforced")
+	}
+
+	// A hash computed with the CORRECT secret must find exactly one session.
+	correctHash := hashTokenForTest(correctSecret, token)
+	var correctCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE token_hash = ?`, correctHash,
+	).Scan(&correctCount); err != nil {
+		t.Fatalf("count (correct secret): %v", err)
+	}
+	if correctCount != 1 {
+		t.Errorf("expected 1 session with correct secret hash, got %d", correctCount)
 	}
 }

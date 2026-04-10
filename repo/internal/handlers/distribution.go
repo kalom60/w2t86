@@ -136,6 +136,10 @@ func (h *DistributionHandler) RecordReturn(c *fiber.Ctx) error {
 	if err != nil || materialID <= 0 {
 		return htmxErr(c, fiber.StatusBadRequest, "Invalid material ID")
 	}
+	returnRequestID, err := strconv.ParseInt(c.FormValue("return_request_id"), 10, 64)
+	if err != nil || returnRequestID <= 0 {
+		return htmxErr(c, fiber.StatusBadRequest, "A valid approved return request ID is required")
+	}
 	scanID := c.FormValue("scan_id")
 	if scanID == "" {
 		return htmxErr(c, fiber.StatusBadRequest, "Scan ID is required")
@@ -145,7 +149,7 @@ func (h *DistributionHandler) RecordReturn(c *fiber.Ctx) error {
 		return htmxErr(c, fiber.StatusBadRequest, "Invalid quantity")
 	}
 
-	if err := h.distService.RecordReturn(orderID, materialID, user.ID, scanID, qty); err != nil {
+	if err := h.distService.RecordReturn(orderID, materialID, user.ID, returnRequestID, scanID, qty); err != nil {
 		return internalErr(c, observability.Distribution, "record return failed", err, "order_id", orderID, "actor_id", user.ID)
 	}
 
@@ -180,6 +184,10 @@ func (h *DistributionHandler) RecordExchange(c *fiber.Ctx) error {
 	if err != nil || newMaterialID <= 0 {
 		return htmxErr(c, fiber.StatusBadRequest, "Invalid new material ID")
 	}
+	returnRequestID, err := strconv.ParseInt(c.FormValue("return_request_id"), 10, 64)
+	if err != nil || returnRequestID <= 0 {
+		return htmxErr(c, fiber.StatusBadRequest, "A valid approved return request ID is required")
+	}
 	scanID := c.FormValue("scan_id")
 	if scanID == "" {
 		return htmxErr(c, fiber.StatusBadRequest, "Scan ID is required")
@@ -189,7 +197,7 @@ func (h *DistributionHandler) RecordExchange(c *fiber.Ctx) error {
 		return htmxErr(c, fiber.StatusBadRequest, "Invalid quantity")
 	}
 
-	if err := h.distService.RecordExchange(orderID, oldMaterialID, newMaterialID, user.ID, scanID, qty); err != nil {
+	if err := h.distService.RecordExchange(orderID, oldMaterialID, newMaterialID, user.ID, returnRequestID, scanID, qty); err != nil {
 		return internalErr(c, observability.Distribution, "record exchange failed", err, "order_id", orderID, "actor_id", user.ID)
 	}
 

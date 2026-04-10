@@ -40,8 +40,16 @@ func TestMessagingService_Send_OutsideDND_SetsDeliveredAt(t *testing.T) {
 	svc, db := newMessagingService(t)
 	userID := insertSvcUser(t, db, "snd_user1")
 
-	// No DND set → should be outside DND → delivered_at is set
-	if err := svc.Send(userID, "order", "Order Ready", "Your order is ready", nil, nil); err != nil {
+	// Explicitly disable DND (start == end) so the send is always outside the
+	// DND window regardless of what time the test runs. Without this the
+	// default quiet-hours window (21:00–07:00 UTC) would suppress delivery
+	// during UTC night hours, making the test time-dependent.
+	msgRepo := repository.NewMessagingRepository(db)
+	if err := msgRepo.SetDND(userID, 0, 0); err != nil {
+		t.Fatalf("SetDND (disable): %v", err)
+	}
+
+	if err := svc.Send(userID, services.TopicOrders, "order", "Order Ready", "Your order is ready", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -82,7 +90,7 @@ func TestMessagingService_Send_InsideDND_NoDelivery(t *testing.T) {
 		t.Fatalf("SetDND: %v", err)
 	}
 
-	if err := svc.Send(userID, "order", "DND Test", "body", nil, nil); err != nil {
+	if err := svc.Send(userID, services.TopicOrders, "order", "DND Test", "body", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -111,7 +119,7 @@ func TestMessagingService_MarkRead(t *testing.T) {
 	svc, db := newMessagingService(t)
 	userID := insertSvcUser(t, db, "mark_user")
 
-	if err := svc.Send(userID, "system", "Hello", "", nil, nil); err != nil {
+	if err := svc.Send(userID, "", "system", "Hello", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -134,6 +142,51 @@ func TestMessagingService_MarkRead(t *testing.T) {
 	}
 	if notifs2[0].ReadAt == nil {
 		t.Error("expected read_at to be set after MarkRead")
+	}
+}
+
+// TestMessagingService_Send_SubscriptionEnforced verifies that Send silently
+// drops a notification when the user has explicitly unsubscribed from the topic.
+func TestMessagingService_Send_SubscriptionEnforced(t *testing.T) {
+	svc, db := newMessagingService(t)
+	userID := insertSvcUser(t, db, "sub_gate_user")
+
+	// Explicitly opt out of TopicOrders.
+	if err := svc.Unsubscribe(userID, services.TopicOrders); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+
+	// Send should succeed (no error) but deliver nothing.
+	if err := svc.Send(userID, services.TopicOrders, "order_update", "Shipped", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	notifs, err := svc.GetInbox(userID, 10, 0)
+	if err != nil {
+		t.Fatalf("GetInbox: %v", err)
+	}
+	if len(notifs) != 0 {
+		t.Errorf("expected 0 notifications after opt-out, got %d", len(notifs))
+	}
+}
+
+// TestMessagingService_Send_DefaultSubscribed verifies that Send delivers a
+// notification when no subscription record exists (default opt-in policy).
+func TestMessagingService_Send_DefaultSubscribed(t *testing.T) {
+	svc, db := newMessagingService(t)
+	userID := insertSvcUser(t, db, "default_sub_user")
+
+	// No subscription row → should default to subscribed.
+	if err := svc.Send(userID, services.TopicOrders, "order_update", "Ready", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	notifs, err := svc.GetInbox(userID, 10, 0)
+	if err != nil {
+		t.Fatalf("GetInbox: %v", err)
+	}
+	if len(notifs) != 1 {
+		t.Errorf("expected 1 notification with default subscription, got %d", len(notifs))
 	}
 }
 

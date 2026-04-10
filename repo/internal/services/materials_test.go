@@ -2,6 +2,7 @@ package services_test
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -172,34 +173,39 @@ func TestMaterialService_Rate_Success(t *testing.T) {
 	}
 }
 
-func TestMaterialService_Rate_DuplicateRating_Upserts(t *testing.T) {
+func TestMaterialService_Rate_DuplicateRating_Rejected(t *testing.T) {
 	svc, db := newMaterialService(t)
 	userID := insertMatUser(t, db, "rater2")
-	matID := insertTestMaterial(t, db, "Upsert Book")
+	matID := insertTestMaterial(t, db, "Once-Only Book")
 
 	if err := svc.Rate(matID, userID, 2); err != nil {
 		t.Fatalf("Rate first: %v", err)
 	}
-	// Update to 5 stars
-	if err := svc.Rate(matID, userID, 5); err != nil {
-		t.Fatalf("Rate second: %v", err)
+	// Second attempt must be rejected.
+	err := svc.Rate(matID, userID, 5)
+	if err == nil {
+		t.Fatal("expected error on second rating, got nil")
+	}
+	if !errors.Is(err, repository.ErrAlreadyRated) {
+		t.Errorf("expected ErrAlreadyRated, got: %v", err)
 	}
 
+	// Original rating must be unchanged.
 	stars, err := svc.GetUserRating(matID, userID)
 	if err != nil {
 		t.Fatalf("GetUserRating: %v", err)
 	}
-	if stars != 5 {
-		t.Errorf("expected 5 stars after upsert, got %d", stars)
+	if stars != 2 {
+		t.Errorf("expected original stars=2, got %d", stars)
 	}
 
-	// Only one rating row should exist
+	// Only one rating row should exist.
 	_, count, err := svc.GetAverageRating(matID)
 	if err != nil {
 		t.Fatalf("GetAverageRating: %v", err)
 	}
 	if count != 1 {
-		t.Errorf("expected 1 rating row after upsert, got %d", count)
+		t.Errorf("expected 1 rating row, got %d", count)
 	}
 }
 

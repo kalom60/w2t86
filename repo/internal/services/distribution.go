@@ -71,25 +71,37 @@ func (s *DistributionService) IssueItems(orderID, actorID int64, scanID string, 
 	actorIDPtr := &actorID
 	orderIDPtr := &orderID
 
+	// Load the authoritative order line items and build a lookup map.
+	orderItems, err := s.orderRepo.GetItemsByOrderID(orderID)
+	if err != nil {
+		return fmt.Errorf("service: IssueItems: load order items: %w", err)
+	}
+	orderedQty := make(map[int64]int, len(orderItems))
+	for _, oi := range orderItems {
+		orderedQty[oi.MaterialID] = oi.Qty
+	}
+
 	for _, item := range items {
-		if item.Qty <= 0 {
-			return fmt.Errorf("service: IssueItems: qty must be positive for material %d", item.MaterialID)
-		}
-		issued := item.IssuedQty
-		if issued <= 0 {
-			issued = item.Qty
-		}
-		if issued > item.Qty {
-			return fmt.Errorf("service: IssueItems: issued_qty (%d) cannot exceed ordered qty (%d) for material %d",
-				issued, item.Qty, item.MaterialID)
+		// Reject materials that are not part of this order.
+		oqty, ok := orderedQty[item.MaterialID]
+		if !ok {
+			return fmt.Errorf("service: IssueItems: material %d is not part of order %d", item.MaterialID, orderID)
 		}
 
-		// Verify the material exists.
-		if _, err := s.materialRepo.GetByID(item.MaterialID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("service: IssueItems: material %d not found", item.MaterialID)
-			}
-			return fmt.Errorf("service: IssueItems: load material %d: %w", item.MaterialID, err)
+		issued := item.IssuedQty
+		if issued <= 0 {
+			// Default to the full DB-authoritative ordered quantity — never the
+			// client-supplied item.Qty, which could be forged lower to fake
+			// full fulfillment with fewer physical copies.
+			issued = oqty
+		}
+		if issued <= 0 {
+			return fmt.Errorf("service: IssueItems: qty must be positive for material %d", item.MaterialID)
+		}
+		// Issued quantity must not exceed the DB-authoritative ordered quantity.
+		if issued > oqty {
+			return fmt.Errorf("service: IssueItems: issued qty (%d) exceeds ordered qty (%d) for material %d",
+				issued, oqty, item.MaterialID)
 		}
 
 		evt := &models.DistributionEvent{
@@ -108,7 +120,8 @@ func (s *DistributionService) IssueItems(orderID, actorID int64, scanID string, 
 	}
 
 	// Mark order items as fulfilled and potentially advance order status.
-	if err := s.markItemsFulfilled(orderID, actorID, items); err != nil {
+	// Pass orderedQty so markItemsFulfilled uses only DB-authoritative quantities.
+	if err := s.markItemsFulfilled(orderID, actorID, items, orderedQty); err != nil {
 		return fmt.Errorf("service: IssueItems: mark fulfilled: %w", err)
 	}
 
@@ -123,14 +136,22 @@ func (s *DistributionService) IssueItems(orderID, actorID int64, scanID string, 
 // "fulfilled"; when it is less, the item is marked "backordered" and a
 // backorder record is created for the shortfall.
 // The order is advanced from pending_shipment → in_transit on the first issue.
-func (s *DistributionService) markItemsFulfilled(orderID, actorID int64, items []IssueItem) error {
+//
+// orderedQtys is the DB-authoritative ordered quantity map (materialID → qty)
+// built from order_items. Client-supplied item.Qty is never used for
+// fulfillment logic — doing so would allow a forged lower qty to fake
+// full fulfillment with fewer physical copies.
+func (s *DistributionService) markItemsFulfilled(orderID, actorID int64, items []IssueItem, orderedQtys map[int64]int) error {
 	for _, item := range items {
+		oqty := orderedQtys[item.MaterialID]
+
 		issued := item.IssuedQty
 		if issued <= 0 {
-			issued = item.Qty
+			// Default to the full DB-authoritative ordered quantity.
+			issued = oqty
 		}
 
-		if issued >= item.Qty {
+		if issued >= oqty {
 			// Fully satisfied — mark fulfilled.
 			if err := s.orderRepo.MarkOrderItemFulfilled(orderID, item.MaterialID); err != nil {
 				return fmt.Errorf("markItemsFulfilled: mark fulfilled material %d: %w", item.MaterialID, err)
@@ -144,7 +165,7 @@ func (s *DistributionService) markItemsFulfilled(orderID, actorID int64, items [
 			if err != nil {
 				return fmt.Errorf("markItemsFulfilled: get order_item_id material %d: %w", item.MaterialID, err)
 			}
-			shortfall := item.Qty - issued
+			shortfall := oqty - issued // DB-authoritative, not client-provided
 			if _, err := s.orderRepo.CreateBackorder(itemID, shortfall); err != nil {
 				return fmt.Errorf("markItemsFulfilled: create backorder material %d: %w", item.MaterialID, err)
 			}
@@ -174,9 +195,28 @@ func (s *DistributionService) markItemsFulfilled(orderID, actorID int64, items [
 
 // RecordReturn records a "returned" distribution event and releases inventory
 // (increments available_qty by qty).
-func (s *DistributionService) RecordReturn(orderID, materialID, actorID int64, scanID string, qty int) error {
+//
+// returnRequestID must reference an approved return_request of type "return"
+// for orderID. The call is rejected if the request does not exist, is not yet
+// approved, or belongs to a different order.
+func (s *DistributionService) RecordReturn(orderID, materialID, actorID, returnRequestID int64, scanID string, qty int) error {
 	if qty <= 0 {
 		return errors.New("service: RecordReturn: qty must be positive")
+	}
+
+	// Require an approved return request of the correct type.
+	rr, err := s.orderRepo.GetReturnRequestByID(returnRequestID)
+	if err != nil {
+		return fmt.Errorf("service: RecordReturn: load return request: %w", err)
+	}
+	if rr.Status != "approved" {
+		return fmt.Errorf("service: RecordReturn: return request %d is not approved (status=%s)", returnRequestID, rr.Status)
+	}
+	if rr.OrderID != orderID {
+		return fmt.Errorf("service: RecordReturn: return request %d belongs to order %d, not %d", returnRequestID, rr.OrderID, orderID)
+	}
+	if rr.Type != "return" {
+		return fmt.Errorf("service: RecordReturn: return request %d has wrong type %q (expected 'return')", returnRequestID, rr.Type)
 	}
 
 	// Verify order exists.
@@ -185,6 +225,28 @@ func (s *DistributionService) RecordReturn(orderID, materialID, actorID int64, s
 			return fmt.Errorf("service: RecordReturn: order %d not found", orderID)
 		}
 		return fmt.Errorf("service: RecordReturn: load order: %w", err)
+	}
+
+	// Validate materialID belongs to this order's line items and that the
+	// returned qty does not exceed what was originally ordered.
+	orderItems, err := s.orderRepo.GetItemsByOrderID(orderID)
+	if err != nil {
+		return fmt.Errorf("service: RecordReturn: load order items: %w", err)
+	}
+	var orderedQty int
+	found := false
+	for _, oi := range orderItems {
+		if oi.MaterialID == materialID {
+			orderedQty = oi.Qty
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("service: RecordReturn: material %d is not part of order %d", materialID, orderID)
+	}
+	if qty > orderedQty {
+		return fmt.Errorf("service: RecordReturn: return qty (%d) exceeds ordered qty (%d) for material %d", qty, orderedQty, materialID)
 	}
 
 	orderIDPtr := &orderID
@@ -205,9 +267,11 @@ func (s *DistributionService) RecordReturn(orderID, materialID, actorID int64, s
 		return fmt.Errorf("service: RecordReturn: record event: %w", err)
 	}
 
-	// Release inventory back to available stock.
-	if err := s.materialRepo.Release(materialID, qty); err != nil {
-		return fmt.Errorf("service: RecordReturn: release inventory: %w", err)
+	// Return copies to available stock. The order is already completed so
+	// reserved_qty for these items has already been decremented by the
+	// completion transition; we only need to increment available_qty.
+	if err := s.materialRepo.ReturnToStock(materialID, qty); err != nil {
+		return fmt.Errorf("service: RecordReturn: return to stock: %w", err)
 	}
 
 	observability.Distribution.Info("item returned", "order_id", orderID, "material_id", materialID, "qty", qty, "scan_id", scanID, "actor_id", actorID)
@@ -219,17 +283,55 @@ func (s *DistributionService) RecordReturn(orderID, materialID, actorID int64, s
 // ---------------------------------------------------------------
 
 // RecordExchange swaps an old copy for a new one in a single logical operation:
-//  1. Records a "returned" event for oldMaterialID.
-//  2. Verifies the new material has available stock.
-//  3. Records an "issued" event for newMaterialID and decrements its
+//  1. Validates the approved exchange request.
+//  2. Records a "returned" event for oldMaterialID.
+//  3. Verifies the new material has available stock.
+//  4. Records an "issued" event for newMaterialID and decrements its
 //     available_qty.
-func (s *DistributionService) RecordExchange(orderID, oldMaterialID, newMaterialID, actorID int64, scanID string, qty int) error {
+//
+// returnRequestID must reference an approved return_request of type "exchange"
+// for orderID.
+func (s *DistributionService) RecordExchange(orderID, oldMaterialID, newMaterialID, actorID, returnRequestID int64, scanID string, qty int) error {
 	if qty <= 0 {
 		return errors.New("service: RecordExchange: qty must be positive")
 	}
 
-	// Return the old copy first (releases its inventory).
-	if err := s.RecordReturn(orderID, oldMaterialID, actorID, scanID, qty); err != nil {
+	// Require an approved exchange request of the correct type.
+	rr, err := s.orderRepo.GetReturnRequestByID(returnRequestID)
+	if err != nil {
+		return fmt.Errorf("service: RecordExchange: load return request: %w", err)
+	}
+	if rr.Status != "approved" {
+		return fmt.Errorf("service: RecordExchange: return request %d is not approved (status=%s)", returnRequestID, rr.Status)
+	}
+	if rr.OrderID != orderID {
+		return fmt.Errorf("service: RecordExchange: return request %d belongs to order %d, not %d", returnRequestID, rr.OrderID, orderID)
+	}
+	if rr.Type != "exchange" {
+		return fmt.Errorf("service: RecordExchange: return request %d has wrong type %q (expected 'exchange')", returnRequestID, rr.Type)
+	}
+
+	// Validate oldMaterialID belongs to this order's line items.
+	exchangeItems, err := s.orderRepo.GetItemsByOrderID(orderID)
+	if err != nil {
+		return fmt.Errorf("service: RecordExchange: load order items: %w", err)
+	}
+	oldMatFound := false
+	for _, oi := range exchangeItems {
+		if oi.MaterialID == oldMaterialID {
+			oldMatFound = true
+			break
+		}
+	}
+	if !oldMatFound {
+		return fmt.Errorf("service: RecordExchange: material %d is not part of order %d", oldMaterialID, orderID)
+	}
+
+	// Return the old copy (releases its inventory).
+	// We pass 0 as returnRequestID to the inner RecordReturn because the
+	// exchange request already covers both legs; RecordReturn's own request
+	// check is bypassed here via the internal call path.
+	if err := s.recordReturnInternal(orderID, oldMaterialID, actorID, scanID, qty); err != nil {
 		return fmt.Errorf("service: RecordExchange: return old: %w", err)
 	}
 
@@ -265,9 +367,12 @@ func (s *DistributionService) RecordExchange(orderID, oldMaterialID, newMaterial
 		return fmt.Errorf("service: RecordExchange: record issue event: %w", err)
 	}
 
-	// Reserve the newly issued material's inventory.
-	if err := s.materialRepo.Reserve(newMaterialID, qty); err != nil {
-		return fmt.Errorf("service: RecordExchange: reserve new material inventory: %w", err)
+	// Directly decrement available_qty for the newly issued material. Because
+	// the exchange is performed post-fulfillment the new copy goes straight
+	// to the student without a reservation phase, so DirectIssue (available
+	// only) is correct — Reserve would incorrectly increment reserved_qty.
+	if err := s.materialRepo.DirectIssue(newMaterialID, qty); err != nil {
+		return fmt.Errorf("service: RecordExchange: direct issue new material: %w", err)
 	}
 
 	observability.Distribution.Info("item exchanged", "order_id", orderID, "old_material_id", oldMaterialID, "new_material_id", newMaterialID, "qty", qty, "actor_id", actorID)
@@ -280,9 +385,13 @@ func (s *DistributionService) RecordExchange(orderID, oldMaterialID, newMaterial
 // ---------------------------------------------------------------
 
 // ReissueItem handles lost or damaged copy replacement:
+//   - Validates that the material has at least one available copy for the
+//     replacement (mirrors the availability check in RecordExchange).
 //   - Records a "lost" or "damaged" event for oldScanID (marking it out of
 //     circulation).
 //   - Records a new "issued" event for newScanID.
+//   - Decrements available_qty for the replacement copy so the inventory ledger
+//     stays consistent with the physical state of the collection.
 //
 // reason must be "lost" or "damaged".
 func (s *DistributionService) ReissueItem(orderID, materialID, actorID int64, oldScanID, newScanID, reason string) error {
@@ -301,6 +410,20 @@ func (s *DistributionService) ReissueItem(orderID, materialID, actorID int64, ol
 		return fmt.Errorf("service: ReissueItem: load order: %w", err)
 	}
 
+	// Verify the material has at least one available copy for the replacement.
+	// A reissue takes a fresh copy from the shelf — the lost/damaged copy is
+	// already gone, so we must confirm stock before committing the event.
+	mat, err := s.materialRepo.GetByID(materialID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("service: ReissueItem: material %d not found", materialID)
+		}
+		return fmt.Errorf("service: ReissueItem: load material: %w", err)
+	}
+	if mat.AvailableQty < 1 {
+		return fmt.Errorf("service: ReissueItem: no available stock for %q — cannot issue replacement", mat.Title)
+	}
+
 	orderIDPtr := &orderID
 	actorIDPtr := &actorID
 
@@ -317,7 +440,7 @@ func (s *DistributionService) ReissueItem(orderID, materialID, actorID int64, ol
 		return fmt.Errorf("service: ReissueItem: record %s event: %w", reason, err)
 	}
 
-	// Issue the replacement copy.
+	// Issue the replacement copy and record the event.
 	newEvt := &models.DistributionEvent{
 		OrderID:     orderIDPtr,
 		MaterialID:  materialID,
@@ -332,7 +455,17 @@ func (s *DistributionService) ReissueItem(orderID, materialID, actorID int64, ol
 		return fmt.Errorf("service: ReissueItem: record replacement issue event: %w", err)
 	}
 
-	observability.Distribution.Info("item reissued", "old_scan_id", oldScanID, "new_scan_id", newScanID, "reason", reason)
+	// Decrement available_qty for the replacement copy (mirrors RecordExchange).
+	// The lost/damaged copy is already out of circulation, so only the new
+	// replacement needs to leave the available pool.
+	if err := s.materialRepo.DirectIssue(materialID, 1); err != nil {
+		return fmt.Errorf("service: ReissueItem: decrement inventory for replacement: %w", err)
+	}
+
+	observability.Distribution.Info("item reissued",
+		"order_id", orderID, "material_id", materialID,
+		"old_scan_id", oldScanID, "new_scan_id", newScanID,
+		"reason", reason, "actor_id", actorID)
 	return nil
 }
 
@@ -366,5 +499,33 @@ func (s *DistributionService) CountBackorders() (int, error) {
 // ---------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------
+
+// recordReturnInternal records the return event and releases inventory without
+// validating a return_request. It is used internally by RecordExchange, which
+// has already validated the exchange request before splitting into legs.
+func (s *DistributionService) recordReturnInternal(orderID, materialID, actorID int64, scanID string, qty int) error {
+	orderIDPtr := &orderID
+	actorIDPtr := &actorID
+	scanIDPtr := &scanID
+
+	evt := &models.DistributionEvent{
+		OrderID:     orderIDPtr,
+		MaterialID:  materialID,
+		Qty:         qty,
+		EventType:   "returned",
+		ScanID:      scanIDPtr,
+		ActorID:     actorIDPtr,
+		CustodyFrom: stringPtr("student"),
+		CustodyTo:   stringPtr("clerk"),
+	}
+	if _, err := s.distRepo.RecordEvent(evt); err != nil {
+		return fmt.Errorf("record event: %w", err)
+	}
+	// Return copies to available stock (post-fulfillment: only available_qty).
+	if err := s.materialRepo.ReturnToStock(materialID, qty); err != nil {
+		return fmt.Errorf("return to stock: %w", err)
+	}
+	return nil
+}
 
 func stringPtr(s string) *string { return &s }

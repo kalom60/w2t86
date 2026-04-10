@@ -1,6 +1,7 @@
 package services
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -100,7 +101,7 @@ func (s *AuthService) Login(username, password string) (token string, user *mode
 		return "", nil, fmt.Errorf("auth: login: generate token: %w", err)
 	}
 
-	tokenHash := hashToken(rawToken)
+	tokenHash := hashToken(s.cfg.SessionSecret, rawToken)
 	expiresAt := time.Now().UTC().Add(sessionDuration)
 
 	if _, err = s.sessionRepo.Create(user.ID, tokenHash, expiresAt); err != nil {
@@ -121,11 +122,31 @@ func (s *AuthService) Login(username, password string) (token string, user *mode
 
 // Logout invalidates the session identified by the raw token.
 func (s *AuthService) Logout(token string) error {
-	hash := hashToken(token)
+	hash := hashToken(s.cfg.SessionSecret, token)
 	if err := s.sessionRepo.Delete(hash); err != nil {
 		return fmt.Errorf("auth: logout: %w", err)
 	}
 	observability.Auth.Info("logout", "token_hash_prefix", hash[:8])
+	return nil
+}
+
+// ChangePassword hashes newPassword and updates the user's password_hash.
+// It also clears the must_change_password flag so the user is not redirected again.
+func (s *AuthService) ChangePassword(userID int64, newPassword string) error {
+	if len(newPassword) < minPasswordLen {
+		return fmt.Errorf("auth: ChangePassword: password must be at least %d characters", minPasswordLen)
+	}
+	hash, err := crypto.HashPassword(newPassword)
+	if err != nil {
+		return fmt.Errorf("auth: ChangePassword: %w", err)
+	}
+	if err := s.userRepo.Update(userID, map[string]interface{}{"password_hash": hash}); err != nil {
+		return fmt.Errorf("auth: ChangePassword: %w", err)
+	}
+	if err := s.userRepo.ClearMustChangePassword(userID); err != nil {
+		return fmt.Errorf("auth: ChangePassword: clear flag: %w", err)
+	}
+	observability.Security.Info("password changed", "user_id", userID)
 	return nil
 }
 
@@ -164,8 +185,11 @@ func generateToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// hashToken returns the SHA-256 hex digest of token.
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+// hashToken returns the HMAC-SHA256 hex digest of token keyed with secret.
+// Using HMAC ensures that a database-level attacker who obtains the token_hash
+// column cannot verify candidate tokens without also knowing SESSION_SECRET.
+func hashToken(secret, token string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil))
 }

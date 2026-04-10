@@ -33,10 +33,28 @@ func NewMessagingService(mr *repository.MessagingRepository) *MessagingService {
 // Sending
 // ---------------------------------------------------------------
 
-// Send creates a notification for userID. If the user is currently in their
-// DND window the notification is persisted but delivered_at is left NULL so
-// that it will be pushed later. Outside DND the delivered_at is set to now.
-func (s *MessagingService) Send(userID int64, notifType, title, body string, refID *int64, refType *string) error {
+// Send creates a notification for userID.
+//
+// topic must be one of the Topic* constants (e.g. TopicOrders).  When topic is
+// non-empty the user's subscription for that topic is checked; if the user has
+// explicitly opted out (active=0) the notification is silently dropped and nil
+// is returned.  An empty topic bypasses the subscription check (use for system
+// messages that must always be delivered).
+//
+// If the user is currently in their DND window the notification is persisted
+// but delivered_at is left NULL so that it will be pushed later.
+func (s *MessagingService) Send(userID int64, topic, notifType, title, body string, refID *int64, refType *string) error {
+	// Subscription gate: honour the user's opt-out if a topic is provided.
+	if topic != "" {
+		subscribed, err := s.msgRepo.IsSubscribedToTopic(userID, topic)
+		if err != nil {
+			return fmt.Errorf("service: MessagingService.Send: check subscription: %w", err)
+		}
+		if !subscribed {
+			return nil // user has opted out of this topic
+		}
+	}
+
 	inDND, err := s.msgRepo.IsInDND(userID)
 	if err != nil {
 		return fmt.Errorf("service: MessagingService.Send: check DND: %w", err)
@@ -70,8 +88,9 @@ func (s *MessagingService) Send(userID int64, notifType, title, body string, ref
 }
 
 // SendToRole sends a notification to every non-deleted user that has the
-// given role. db is the raw *sql.DB used to enumerate users.
-func (s *MessagingService) SendToRole(db *sql.DB, role, notifType, title, body string) error {
+// given role. topic is forwarded to Send so per-user subscription preferences
+// are respected. db is the raw *sql.DB used to enumerate users.
+func (s *MessagingService) SendToRole(db *sql.DB, role, topic, notifType, title, body string) error {
 	const q = `SELECT id FROM users WHERE role = ? AND deleted_at IS NULL`
 	rows, err := db.Query(q, role)
 	if err != nil {
@@ -92,7 +111,7 @@ func (s *MessagingService) SendToRole(db *sql.DB, role, notifType, title, body s
 	}
 
 	for _, uid := range userIDs {
-		if err := s.Send(uid, notifType, title, body, nil, nil); err != nil {
+		if err := s.Send(uid, topic, notifType, title, body, nil, nil); err != nil {
 			// Continue on individual failure — best-effort broadcast.
 			continue
 		}

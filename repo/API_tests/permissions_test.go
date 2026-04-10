@@ -150,6 +150,7 @@ func TestPermission_Analytics_AdminAllowed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPermission_AdminReturns_InstructorAllowed returns non-403 for instructor.
+// Instructor is the legacy name for the "manager" role in this system.
 func TestPermission_AdminReturns_InstructorAllowed(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()
@@ -157,7 +158,20 @@ func TestPermission_AdminReturns_InstructorAllowed(t *testing.T) {
 	cookie := loginAs(t, app, db, "instructor")
 	resp := makeRequest(app, http.MethodGet, "/admin/returns", "", cookie, "")
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		t.Fatalf("instructor should access /admin/returns, got %d", resp.StatusCode)
+		t.Fatalf("instructor (manager role) should access /admin/returns, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_AdminReturns_ManagerAllowed verifies that a user with the
+// explicit "manager" role can access the return-approval queue.
+func TestPermission_AdminReturns_ManagerAllowed(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "manager")
+	resp := makeRequest(app, http.MethodGet, "/admin/returns", "", cookie, "")
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("manager role should access /admin/returns, got %d", resp.StatusCode)
 	}
 }
 
@@ -170,6 +184,58 @@ func TestPermission_AdminReturns_StudentForbidden(t *testing.T) {
 	resp := makeRequest(app, http.MethodGet, "/admin/returns", "", cookie, "")
 	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 403/401 for student on admin returns, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_AdminReturns_ClerkForbidden verifies that a clerk cannot
+// access the return-approval queue (manager/instructor role required).
+func TestPermission_AdminReturns_ClerkForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "clerk")
+	resp := makeRequest(app, http.MethodGet, "/admin/returns", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for clerk on admin returns, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_AdminReturns_ModeratorForbidden verifies that a moderator
+// cannot access the return-approval queue.
+func TestPermission_AdminReturns_ModeratorForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "moderator")
+	resp := makeRequest(app, http.MethodGet, "/admin/returns", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for moderator on admin returns, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_ApproveReturn_StudentForbidden verifies a student cannot POST
+// to the approve-return endpoint (manager role required).
+func TestPermission_ApproveReturn_StudentForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	resp := makeRequest(app, http.MethodPost, "/admin/returns/1/approve", "", cookie, "application/x-www-form-urlencoded")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for student approving return, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_ApproveReturn_ClerkForbidden verifies a clerk cannot approve
+// return requests (only instructor/admin — the manager role — may approve).
+func TestPermission_ApproveReturn_ClerkForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "clerk")
+	resp := makeRequest(app, http.MethodPost, "/admin/returns/1/approve", "", cookie, "application/x-www-form-urlencoded")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for clerk approving return, got %d", resp.StatusCode)
 	}
 }
 
@@ -213,5 +279,170 @@ func TestPermission_ApproveComment_StudentForbidden(t *testing.T) {
 	resp := makeRequest(app, http.MethodPost, "/moderation/1/approve", "", cookie, "", htmx())
 	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 403/401 for student approving comment, got %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics endpoint — admin-only
+// ---------------------------------------------------------------------------
+
+// TestPermission_Metrics_AdminAllowed verifies that an admin can access /metrics.
+func TestPermission_Metrics_AdminAllowed(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "admin")
+	resp := makeRequest(app, http.MethodGet, "/metrics", "", cookie, "")
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("admin should be allowed to access /metrics, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_Metrics_StudentForbidden verifies that a student cannot access /metrics.
+func TestPermission_Metrics_StudentForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	resp := makeRequest(app, http.MethodGet, "/metrics", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for student on /metrics, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_Metrics_InstructorForbidden verifies that an instructor cannot access /metrics.
+func TestPermission_Metrics_InstructorForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "instructor")
+	resp := makeRequest(app, http.MethodGet, "/metrics", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for instructor on /metrics, got %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Geospatial analytics map endpoints — admin-only
+// ---------------------------------------------------------------------------
+
+// TestPermission_MapData_AdminAllowed verifies an admin can access /analytics/map/data.
+func TestPermission_MapData_AdminAllowed(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "admin")
+	resp := makeRequest(app, http.MethodGet, "/analytics/map/data", "", cookie, "")
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("admin should be allowed on /analytics/map/data, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_MapData_StudentForbidden verifies a student cannot access /analytics/map/data.
+func TestPermission_MapData_StudentForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	resp := makeRequest(app, http.MethodGet, "/analytics/map/data", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for student on /analytics/map/data, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_MapCompute_StudentForbidden verifies a student cannot POST /analytics/map/compute.
+func TestPermission_MapCompute_StudentForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	resp := makeRequest(app, http.MethodPost, "/analytics/map/compute", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for student on /analytics/map/compute, got %d", resp.StatusCode)
+	}
+}
+
+// TestPermission_MapBufferQuery_InstructorForbidden verifies an instructor cannot access
+// geospatial buffer endpoint (admin-only).
+func TestPermission_MapBufferQuery_InstructorForbidden(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "instructor")
+	resp := makeRequest(app, http.MethodGet, "/analytics/map/buffer", "", cookie, "")
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for instructor on /analytics/map/buffer, got %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard stat API — sensitive stats must be admin-only
+// ---------------------------------------------------------------------------
+
+// sensitiveStats lists the stat names that expose internal operational metrics
+// and must only be served to admin users.
+var sensitiveStats = []string{
+	"total-orders",
+	"active-users",
+	"conversion-rate",
+	"repeat-purchase",
+	"pending-issues",
+	"backorders",
+	"moderation-queue",
+	"course-plans",
+	"pending-returns",
+}
+
+// TestPermission_Stats_SensitiveStatsForbiddenForStudent verifies that each
+// sensitive stat returns 403 when requested by a student.
+func TestPermission_Stats_SensitiveStatsForbiddenForStudent(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	for _, stat := range sensitiveStats {
+		stat := stat // capture
+		t.Run(stat, func(t *testing.T) {
+			resp := makeRequest(app, http.MethodGet, fmt.Sprintf("/api/stats/%s", stat), "", cookie, "")
+			if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("stat %q: expected 403/401 for student, got %d", stat, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestPermission_Stats_SensitiveStatsForbiddenForInstructor verifies that each
+// sensitive stat returns 403 when requested by an instructor (non-admin).
+func TestPermission_Stats_SensitiveStatsForbiddenForInstructor(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "instructor")
+	for _, stat := range sensitiveStats {
+		stat := stat
+		t.Run(stat, func(t *testing.T) {
+			resp := makeRequest(app, http.MethodGet, fmt.Sprintf("/api/stats/%s", stat), "", cookie, "")
+			if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("stat %q: expected 403/401 for instructor, got %d", stat, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestPermission_Stats_AdminCanAccessAllStats verifies that an admin can
+// retrieve every sensitive stat without a 403/401.
+func TestPermission_Stats_AdminCanAccessAllStats(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "admin")
+	for _, stat := range sensitiveStats {
+		stat := stat
+		t.Run(stat, func(t *testing.T) {
+			resp := makeRequest(app, http.MethodGet, fmt.Sprintf("/api/stats/%s", stat), "", cookie, "")
+			if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+				t.Fatalf("stat %q: admin should have access, got %d", stat, resp.StatusCode)
+			}
+		})
 	}
 }

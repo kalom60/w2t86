@@ -50,6 +50,7 @@ func newOrderTestDB(t *testing.T) *sql.DB {
 			total_qty     INTEGER DEFAULT 0,
 			available_qty INTEGER DEFAULT 0,
 			reserved_qty  INTEGER DEFAULT 0,
+			price         REAL    DEFAULT 0,
 			status        TEXT    DEFAULT 'active',
 			created_at    TEXT    DEFAULT (datetime('now')),
 			updated_at    TEXT    DEFAULT (datetime('now')),
@@ -62,7 +63,8 @@ func newOrderTestDB(t *testing.T) *sql.DB {
 			total_amount  REAL    DEFAULT 0,
 			auto_close_at TEXT,
 			created_at    TEXT    DEFAULT (datetime('now')),
-			updated_at    TEXT    DEFAULT (datetime('now'))
+			updated_at    TEXT    DEFAULT (datetime('now')),
+			completed_at  TEXT
 		);
 		CREATE TABLE IF NOT EXISTS order_items (
 			id                 INTEGER PRIMARY KEY,
@@ -82,15 +84,36 @@ func newOrderTestDB(t *testing.T) *sql.DB {
 			created_at  TEXT    DEFAULT (datetime('now'))
 		);
 		CREATE TABLE IF NOT EXISTS return_requests (
-			id          INTEGER PRIMARY KEY,
-			order_id    INTEGER NOT NULL REFERENCES orders(id),
-			user_id     INTEGER NOT NULL REFERENCES users(id),
-			type        TEXT    NOT NULL,
-			status      TEXT    DEFAULT 'pending',
-			reason      TEXT,
-			requested_at TEXT   DEFAULT (datetime('now')),
-			resolved_at TEXT,
-			resolved_by INTEGER REFERENCES users(id)
+			id                      INTEGER PRIMARY KEY,
+			order_id                INTEGER NOT NULL REFERENCES orders(id),
+			user_id                 INTEGER NOT NULL REFERENCES users(id),
+			type                    TEXT    NOT NULL,
+			status                  TEXT    DEFAULT 'pending',
+			reason                  TEXT,
+			replacement_material_id INTEGER,
+			requested_at            TEXT    DEFAULT (datetime('now')),
+			resolved_at             TEXT,
+			resolved_by             INTEGER REFERENCES users(id)
+		);
+		CREATE TABLE IF NOT EXISTS financial_transactions (
+			id                INTEGER PRIMARY KEY,
+			order_id          INTEGER REFERENCES orders(id),
+			return_request_id INTEGER REFERENCES return_requests(id),
+			type              TEXT    NOT NULL,
+			amount            REAL    NOT NULL DEFAULT 0,
+			status            TEXT    DEFAULT 'pending',
+			reference         TEXT,
+			note              TEXT,
+			actor_id          INTEGER REFERENCES users(id),
+			created_at        TEXT    DEFAULT (datetime('now')),
+			updated_at        TEXT    DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS backorders (
+			id            INTEGER PRIMARY KEY,
+			order_item_id INTEGER NOT NULL,
+			qty           INTEGER NOT NULL,
+			resolved_at   TEXT,
+			resolved_by   INTEGER
 		);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -117,8 +140,8 @@ func seedUser(t *testing.T, db *sql.DB) int64 {
 func seedMaterial(t *testing.T, db *sql.DB, title string, availQty int, status string) int64 {
 	t.Helper()
 	res, err := db.Exec(`
-		INSERT INTO materials (title, total_qty, available_qty, reserved_qty, status)
-		VALUES (?, ?, ?, 0, ?)`,
+		INSERT INTO materials (title, total_qty, available_qty, reserved_qty, price, status)
+		VALUES (?, ?, ?, 0, 9.99, ?)`,
 		title, availQty, availQty, status)
 	if err != nil {
 		t.Fatalf("seedMaterial %q: %v", title, err)
@@ -147,7 +170,7 @@ func TestPlaceOrder_Success(t *testing.T) {
 	matID  := seedMaterial(t, db, "Math Textbook", 10, "active")
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 2, UnitPrice: 15.00},
+		{MaterialID: matID, Qty: 2},
 	}
 	order, err := svc.PlaceOrder(userID, items)
 	if err != nil {
@@ -178,7 +201,7 @@ func TestPlaceOrder_InsufficientStock(t *testing.T) {
 	matID  := seedMaterial(t, db, "Science Book", 1, "active")
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 5, UnitPrice: 10.00},
+		{MaterialID: matID, Qty: 5},
 	}
 	_, err := svc.PlaceOrder(userID, items)
 	if err == nil {
@@ -194,7 +217,7 @@ func TestConfirmPayment_TransitionValid(t *testing.T) {
 	matID  := seedMaterial(t, db, "History Book", 5, "active")
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 1, UnitPrice: 20.00},
+		{MaterialID: matID, Qty: 1},
 	}
 	order, err := svc.PlaceOrder(userID, items)
 	if err != nil {
@@ -223,7 +246,7 @@ func TestCancelOrder_StudentCanCancelPendingPayment(t *testing.T) {
 	matID  := seedMaterial(t, db, "Art Supplies", 3, "active")
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 1, UnitPrice: 5.00},
+		{MaterialID: matID, Qty: 1},
 	}
 	order, err := svc.PlaceOrder(userID, items)
 	if err != nil {
@@ -260,7 +283,7 @@ func TestCancelOrder_StudentCannotCancelPendingShipment(t *testing.T) {
 	matID  := seedMaterial(t, db, "Chemistry Book", 5, "active")
 
 	items := []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 1, UnitPrice: 25.00},
+		{MaterialID: matID, Qty: 1},
 	}
 	order, err := svc.PlaceOrder(userID, items)
 	if err != nil {
@@ -342,6 +365,18 @@ func TestAutoClose_CancelsOverdueOrders(t *testing.T) {
 	}
 	if avail != 10 {
 		t.Errorf("expected available_qty=10 after auto-close, got %d", avail)
+	}
+
+	// Verify reserved_qty was released back to 0 and did not go negative.
+	var reserved int
+	if err := db.QueryRow(`SELECT reserved_qty FROM materials WHERE id = ?`, matID).Scan(&reserved); err != nil {
+		t.Fatalf("query reserved_qty: %v", err)
+	}
+	if reserved < 0 {
+		t.Errorf("reserved_qty went negative after auto-close: %d", reserved)
+	}
+	if reserved != 0 {
+		t.Errorf("expected reserved_qty=0 after auto-close released the reservation, got %d", reserved)
 	}
 }
 
@@ -448,5 +483,56 @@ func TestApproveReturn_Exchange_SucceedsWithStock(t *testing.T) {
 	}
 	if status != "approved" {
 		t.Errorf("expected status 'approved', got %q", status)
+	}
+}
+
+// ---------------------------------------------------------------
+// Unauthorized return approval
+// ---------------------------------------------------------------
+
+// TestApproveReturn_StudentForbidden verifies that a student cannot approve
+// return requests (only admin/instructor may).
+func TestApproveReturn_StudentForbidden(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	svc := newOrderService(t, db)
+
+	rrID, actorID := seedCompletedOrderWithReturn(t, db, "return", nil)
+
+	err := svc.ApproveReturn(rrID, actorID, "student")
+	if err == nil {
+		t.Error("expected error for student approving return, got nil")
+	}
+	if !strings.Contains(err.Error(), "manager") && !strings.Contains(err.Error(), "only") {
+		t.Errorf("expected authorization error, got: %v", err)
+	}
+}
+
+// TestApproveReturn_ManagerRoleAllowed verifies that a user with the explicit
+// "manager" role (as specified in the prompt) can approve return requests.
+func TestApproveReturn_ManagerRoleAllowed(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	svc := newOrderService(t, db)
+
+	rrID, actorID := seedCompletedOrderWithReturn(t, db, "return", nil)
+
+	if err := svc.ApproveReturn(rrID, actorID, "manager"); err != nil {
+		t.Errorf("expected manager role to be allowed to approve returns, got: %v", err)
+	}
+}
+
+// TestApproveReturn_ClerkForbidden verifies that a clerk cannot approve
+// return requests (only admin/instructor may).
+func TestApproveReturn_ClerkForbidden(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	svc := newOrderService(t, db)
+
+	rrID, actorID := seedCompletedOrderWithReturn(t, db, "return", nil)
+
+	err := svc.ApproveReturn(rrID, actorID, "clerk")
+	if err == nil {
+		t.Error("expected error for clerk approving return, got nil")
+	}
+	if !strings.Contains(err.Error(), "manager") && !strings.Contains(err.Error(), "only") {
+		t.Errorf("expected authorization error, got: %v", err)
 	}
 }

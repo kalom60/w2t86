@@ -10,9 +10,9 @@ import (
 )
 
 // formOrder builds a URL-encoded POST body for PlaceOrder.
-// materialID and qty are the single line-item values.
+// unit_price is intentionally omitted — the server fetches the authoritative price.
 func formOrder(materialID int64, qty int) string {
-	return fmt.Sprintf("material_id=%d&qty=%d&unit_price=9.99", materialID, qty)
+	return fmt.Sprintf("material_id=%d&qty=%d", materialID, qty)
 }
 
 // TestPlaceOrder_Success verifies that POST /orders with a valid material/qty
@@ -136,6 +136,36 @@ func TestConfirmPayment(t *testing.T) {
 	}
 	if status != "pending_shipment" {
 		t.Errorf("expected status 'pending_shipment', got %q", status)
+	}
+}
+
+// TestConfirmPayment_OtherUsersOrder verifies that a student cannot pay for
+// another user's order and receives 403/422.
+func TestConfirmPayment_OtherUsersOrder(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	// Create an order for a different (other) user.
+	otherUser := createTestUser(t, db, "student")
+	otherOrder := createTestOrder(t, db, otherUser.ID)
+
+	// Log in as a different student.
+	cookie := loginAs(t, app, db, "student")
+
+	resp := makeRequest(app, http.MethodPost,
+		fmt.Sprintf("/orders/%d/pay", otherOrder.ID),
+		"", cookie, "application/x-www-form-urlencoded")
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound {
+		t.Fatalf("expected rejection (403/422) when student pays another user's order, got %d", resp.StatusCode)
+	}
+	// Verify the order remains in its original state.
+	var status string
+	if err := db.QueryRow(`SELECT status FROM orders WHERE id = ?`, otherOrder.ID).Scan(&status); err != nil {
+		t.Fatalf("query order status: %v", err)
+	}
+	if status != "pending_payment" {
+		t.Errorf("other user's order should stay pending_payment, got %q", status)
 	}
 }
 
@@ -291,6 +321,74 @@ func TestSubmitReturnRequest(t *testing.T) {
 	}
 }
 
+// TestPlaceOrder_TamperedPrice verifies that a client-supplied unit_price is
+// ignored and the server uses the authoritative catalog price instead.
+// The test submits unit_price=0.01 for a material priced at $9.99 and asserts
+// that the stored total_amount reflects the real price, not the forged one.
+func TestPlaceOrder_TamperedPrice(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+	mat := createTestMaterial(t, db) // Price = 9.99
+
+	// Forge unit_price=0.01 in the request body.
+	body := fmt.Sprintf("material_id=%d&qty=1&unit_price=0.01", mat.ID)
+	resp := makeRequest(app, http.MethodPost, "/orders", body, cookie, "application/x-www-form-urlencoded")
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 on place order, got %d; body: %s", resp.StatusCode, readBody(resp))
+	}
+
+	// Find the order in the DB and verify the server used the catalog price.
+	var total float64
+	if err := db.QueryRow(
+		`SELECT total_amount FROM orders ORDER BY id DESC LIMIT 1`,
+	).Scan(&total); err != nil {
+		t.Fatalf("query total_amount: %v", err)
+	}
+	if total < 9.0 {
+		t.Errorf("expected total_amount ~9.99 (catalog price), got %.2f — server accepted forged price", total)
+	}
+}
+
+// TestConfirmPayment_CreatesFinancialReceipt verifies that confirming payment
+// atomically inserts a financial_transactions row with type="receipt" so the
+// audit trail is never broken.
+func TestConfirmPayment_CreatesFinancialReceipt(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	cookie := loginAs(t, app, db, "student")
+
+	var userID int64
+	if err := db.QueryRow(`SELECT user_id FROM sessions ORDER BY id DESC LIMIT 1`).Scan(&userID); err != nil {
+		t.Fatalf("find session user: %v", err)
+	}
+
+	order := createTestOrder(t, db, userID)
+
+	resp := makeRequest(app, http.MethodPost,
+		fmt.Sprintf("/orders/%d/pay", order.ID),
+		"", cookie, "application/x-www-form-urlencoded")
+
+	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 or 302 on confirm payment, got %d; body: %s",
+			resp.StatusCode, readBody(resp))
+	}
+
+	// Assert a financial_transactions receipt row was inserted.
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM financial_transactions WHERE order_id = ? AND type = 'receipt'`,
+		order.ID,
+	).Scan(&count); err != nil {
+		t.Fatalf("query financial_transactions: %v", err)
+	}
+	if count == 0 {
+		t.Error("expected financial_transactions row with type='receipt' after payment confirmation")
+	}
+}
+
 // TestApproveReturn verifies POST /admin/returns/:id/approve (instructor role)
 // transitions the return request to approved.
 func TestApproveReturn(t *testing.T) {
@@ -334,5 +432,40 @@ func TestApproveReturn(t *testing.T) {
 	}
 	if status != "approved" {
 		t.Errorf("expected status 'approved', got %q", status)
+	}
+}
+
+// TestApproveReturn_ClerkForbidden_Integration verifies at the HTTP layer that
+// a clerk (not the manager/instructor role) receives 403 on the approve endpoint.
+func TestApproveReturn_ClerkForbidden_Integration(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	clerkCookie := loginAs(t, app, db, "clerk")
+
+	// Use a non-existent ID; the role check fires before any DB lookup.
+	resp := makeRequest(app, http.MethodPost,
+		"/admin/returns/999/approve",
+		"", clerkCookie, "application/x-www-form-urlencoded", htmxHeaders())
+
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for clerk approving return, got %d", resp.StatusCode)
+	}
+}
+
+// TestApproveReturn_StudentForbidden_Integration verifies at the HTTP layer that
+// a student (not the manager/instructor role) receives 403 on the approve endpoint.
+func TestApproveReturn_StudentForbidden_Integration(t *testing.T) {
+	app, db, cleanup := newTestApp(t)
+	defer cleanup()
+
+	studentCookie := loginAs(t, app, db, "student")
+
+	resp := makeRequest(app, http.MethodPost,
+		"/admin/returns/999/approve",
+		"", studentCookie, "application/x-www-form-urlencoded", htmxHeaders())
+
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 403/401 for student approving return, got %d", resp.StatusCode)
 	}
 }

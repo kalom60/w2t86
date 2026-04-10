@@ -237,7 +237,7 @@ func TestOrders_MarkShipped_ClerkAllowed(t *testing.T) {
 	studentUser := createUser(t, db, "student")
 	orderRepo := repository.NewOrderRepository(db)
 	order, err := orderRepo.Create(studentUser.ID, []repository.OrderItemInput{
-		{MaterialID: mat.ID, Qty: 1, UnitPrice: 9.99},
+		{MaterialID: mat.ID, Qty: 1},
 	})
 	if err != nil {
 		t.Fatalf("create order: %v", err)

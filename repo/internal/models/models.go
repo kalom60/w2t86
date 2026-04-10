@@ -16,20 +16,28 @@ package models
 
 // User represents a row in the users table.
 type User struct {
-	ID             int64   `db:"id"`
-	Username       string  `db:"username"`
-	Email          string  `db:"email"`
-	PasswordHash   string  `db:"password_hash"`
-	Role           string  `db:"role"`
-	FailedAttempts int     `db:"failed_attempts"`
-	LockedUntil    *string `db:"locked_until"`
-	DateOfBirth    *string `db:"date_of_birth"`
-	FullName       *string `db:"full_name"`    // real name; used for duplicate detection
-	ExternalID     *string `db:"external_id"`  // institution-issued ID (student/employee number)
-	CreatedAt      string  `db:"created_at"`
-	UpdatedAt      string  `db:"updated_at"`
-	DeletedAt      *string `db:"deleted_at"`
+	ID                 int64   `db:"id"`
+	Username           string  `db:"username"`
+	Email              string  `db:"email"`
+	PasswordHash       string  `db:"password_hash"`
+	Role               string  `db:"role"`
+	FailedAttempts     int     `db:"failed_attempts"`
+	LockedUntil        *string `db:"locked_until"`
+	DateOfBirth        *string `db:"date_of_birth"`
+	FullName           *string `db:"full_name"`            // real name; AES-256-GCM encrypted at rest
+	FullNameIdx        *string `db:"full_name_idx"`        // HMAC blind index for duplicate detection
+	FullNamePhonetic   *string `db:"full_name_phonetic"`   // Soundex code; privacy-preserving fuzzy match
+	ExternalID         *string `db:"external_id"`          // institution-issued ID; AES-256-GCM encrypted
+	ExternalIDIdx      *string `db:"external_id_idx"`      // HMAC blind index for duplicate detection
+	CreatedAt          string  `db:"created_at"`
+	UpdatedAt          string  `db:"updated_at"`
+	DeletedAt          *string `db:"deleted_at"`
+	MustChangePassword int     `db:"must_change_password"` // 1 = redirect to password reset on next login
 }
+
+// GetID returns the user's ID, satisfying the observability hasID interface
+// used by the request logger to correlate user IDs in log output.
+func (u *User) GetID() int64 { return u.ID }
 
 // Session represents a row in the sessions table.
 type Session struct {
@@ -40,10 +48,15 @@ type Session struct {
 	CreatedAt string `db:"created_at"`
 }
 
-// UserCustomField represents a row in the user_custom_fields table.
-type UserCustomField struct {
+// UserCustomField is an alias for EntityCustomField retained for backwards
+// compatibility with existing handler/service signatures.
+type UserCustomField = EntityCustomField
+
+// EntityCustomField represents a row in the entity_custom_fields table.
+type EntityCustomField struct {
 	ID          int64   `db:"id"`
-	UserID      int64   `db:"user_id"`
+	EntityType  string  `db:"entity_type"`
+	EntityID    int64   `db:"entity_id"`
 	FieldName   string  `db:"field_name"`
 	FieldValue  *string `db:"field_value"`
 	IsEncrypted int     `db:"is_encrypted"`
@@ -66,6 +79,7 @@ type Material struct {
 	TotalQty     int     `db:"total_qty"`
 	AvailableQty int     `db:"available_qty"`
 	ReservedQty  int     `db:"reserved_qty"`
+	Price        float64 `db:"price"`        // authoritative catalog price; server-enforced on every order
 	Status       string  `db:"status"`
 	CreatedAt    string  `db:"created_at"`
 	UpdatedAt    string  `db:"updated_at"`
@@ -159,6 +173,7 @@ type Order struct {
 	AutoCloseAt *string `db:"auto_close_at"`
 	CreatedAt   string  `db:"created_at"`
 	UpdatedAt   string  `db:"updated_at"`
+	CompletedAt *string `db:"completed_at"` // set when status transitions to "completed"
 }
 
 // OrderItem represents a row in the order_items table.
@@ -285,6 +300,24 @@ type SpatialAggregate struct {
 	ComputedAt string   `db:"computed_at"`
 }
 
+// TrajectoryPoint is one hop in a material's distribution scan chain.
+type TrajectoryPoint struct {
+	ScanID      string `db:"scan_id"`
+	EventType   string `db:"event_type"`
+	CustodyFrom string `db:"custody_from"`
+	CustodyTo   string `db:"custody_to"`
+	OccurredAt  string `db:"occurred_at"`
+}
+
+// RegionStat summarises order and distribution activity for an admin region.
+type RegionStat struct {
+	RegionName  string  `db:"region_name"`
+	OrderCount  int     `db:"order_count"`
+	ScanCount   int     `db:"scan_count"`
+	Lat         float64 `db:"lat"`
+	Lng         float64 `db:"lng"`
+}
+
 // ---------------------------------------------------------------
 // Course Planning
 // ---------------------------------------------------------------
@@ -367,6 +400,21 @@ type FinancialTransaction struct {
 	ActorID         *int64   `db:"actor_id"`
 	CreatedAt       string   `db:"created_at"`
 	UpdatedAt       string   `db:"updated_at"`
+}
+
+// EntityCustomFieldAudit represents an immutable row in entity_custom_fields_audit.
+// One record is written for every set or delete mutation on entity_custom_fields.
+type EntityCustomFieldAudit struct {
+	ID          int64   `db:"id"`
+	EntityType  string  `db:"entity_type"`
+	EntityID    int64   `db:"entity_id"`
+	FieldName   string  `db:"field_name"`
+	OldValue    *string `db:"old_value"`    // nil when the field did not previously exist
+	NewValue    *string `db:"new_value"`    // nil when the field is deleted
+	IsEncrypted int     `db:"is_encrypted"`
+	ActorID     int64   `db:"actor_id"`
+	Reason      string  `db:"reason"`
+	ChangedAt   string  `db:"changed_at"`
 }
 
 // EntityDuplicate represents a row in the entity_duplicates table.

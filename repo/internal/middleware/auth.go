@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -16,13 +17,15 @@ import (
 // AuthMiddleware validates session cookies and loads the current user into
 // request locals.
 type AuthMiddleware struct {
-	sessionRepo *repository.SessionRepository
-	userRepo    *repository.UserRepository
+	sessionRepo   *repository.SessionRepository
+	userRepo      *repository.UserRepository
+	sessionSecret string
 }
 
-// NewAuthMiddleware creates an AuthMiddleware from the provided repositories.
-func NewAuthMiddleware(sr *repository.SessionRepository, ur *repository.UserRepository) *AuthMiddleware {
-	return &AuthMiddleware{sessionRepo: sr, userRepo: ur}
+// NewAuthMiddleware creates an AuthMiddleware from the provided repositories
+// and the SESSION_SECRET used to verify token HMAC signatures.
+func NewAuthMiddleware(sr *repository.SessionRepository, ur *repository.UserRepository, sessionSecret string) *AuthMiddleware {
+	return &AuthMiddleware{sessionRepo: sr, userRepo: ur, sessionSecret: sessionSecret}
 }
 
 // RequireAuth is a Fiber middleware handler that:
@@ -41,7 +44,7 @@ func (m *AuthMiddleware) RequireAuth() fiber.Handler {
 		}
 
 		// Hash the raw token the same way it was stored on login.
-		hash := hashToken(token)
+		hash := hashToken(m.sessionSecret, token)
 
 		session, err := m.sessionRepo.GetByTokenHash(hash)
 		if err != nil {
@@ -80,8 +83,9 @@ func GetUser(c *fiber.Ctx) *models.User {
 	return u
 }
 
-// hashToken returns the lowercase hex SHA-256 digest of token.
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+// hashToken returns the HMAC-SHA256 hex digest of token keyed with secret.
+func hashToken(secret, token string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil))
 }

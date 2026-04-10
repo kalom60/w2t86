@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	fibercsrf "github.com/gofiber/fiber/v2/middleware/csrf"
 	"github.com/gofiber/template/html/v2"
 
 	"w2t86/internal/config"
@@ -72,10 +73,12 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	courseRepo := repository.NewCourseRepository(db)
 
 	// Wire config (minimal).
+	// EncryptionKey must be a valid 64-hex-char (32-byte) key so that
+	// encryptSensitiveField no longer falls back to plaintext storage.
 	cfg := &config.Config{
 		AppEnv:        "test",
 		SessionSecret: "test-secret",
-		EncryptionKey: "",
+		EncryptionKey: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
 	}
 
 	// Wire services.
@@ -95,13 +98,13 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	orderHandler := handlers.NewOrderHandler(orderService)
 	courseHandler := handlers.NewCourseHandler(courseService)
 	distributionHandler := handlers.NewDistributionHandler(distributionService)
-	messagingHandler := handlers.NewMessagingHandler(messagingService)
+	messagingHandler := handlers.NewMessagingHandler(messagingService, "UTC")
 	moderationHandler := handlers.NewModerationHandler(moderationService, messagingService)
 	analyticsHandler := handlers.NewAnalyticsHandler(analyticsService)
 	adminHandler := handlers.NewAdminHandler(adminService, authService)
 
 	// Wire middleware.
-	authMiddleware := middleware.NewAuthMiddleware(sessionRepo, userRepo)
+	authMiddleware := middleware.NewAuthMiddleware(sessionRepo, userRepo, cfg.SessionSecret)
 	requireAuth := authMiddleware.RequireAuth()
 
 	// Per-role RBAC middleware helpers.
@@ -161,10 +164,13 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 		}
 		return v
 	})
-	engine.AddFunc("hourRange", func() []int {
-		hours := make([]int, 24)
+	engine.AddFunc("hourRange", func() []map[string]interface{} {
+		hours := make([]map[string]interface{}, 24)
 		for i := range hours {
-			hours[i] = i
+			hours[i] = map[string]interface{}{
+				"Val":   i,
+				"Label": fmt.Sprintf("%02d:00", i),
+			}
 		}
 		return hours
 	})
@@ -189,6 +195,34 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 		return c.Next()
 	})
 
+	// Apply CSRF middleware globally, mirroring production.
+	// In production, CSRF runs after RequireAuth (it's added via group.Use after the
+	// group constructor sets RequireAuth). Replicate that ordering by skipping CSRF
+	// for unauthenticated requests — RequireAuth will reject those with 401/302.
+	app.Use(fibercsrf.New(fibercsrf.Config{
+		KeyLookup:      "header:X-Csrf-Token",
+		CookieName:     "csrf_token",
+		CookieHTTPOnly: false,
+		CookieSameSite: "Strict",
+		Extractor: func(c *fiber.Ctx) (string, error) {
+			if tok := c.Get("X-Csrf-Token"); tok != "" {
+				return tok, nil
+			}
+			if tok := c.FormValue("csrf_token"); tok != "" {
+				return tok, nil
+			}
+			return "", fmt.Errorf("CSRF token not found")
+		},
+		Next: func(c *fiber.Ctx) bool {
+			p := c.Path()
+			if p == "/login" || strings.HasPrefix(p, "/share/") || p == "/health" {
+				return true
+			}
+			// Skip for unauthenticated requests: auth middleware handles them.
+			return c.Cookies("session_token") == ""
+		},
+	}))
+
 	// Health.
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
@@ -204,6 +238,9 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	// ------------------------------------------------------------------
 	// Protected routes — RequireAuth only
 	// ------------------------------------------------------------------
+	app.Get("/account/change-password",  requireAuth, authHandler.ChangePasswordPage)
+	app.Post("/account/change-password", requireAuth, authHandler.ChangePassword)
+
 	app.Post("/logout", requireAuth, authHandler.Logout)
 
 	app.Get("/dashboard", requireAuth, func(c *fiber.Ctx) error {
@@ -265,6 +302,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Post("/inbox/subscribe", requireAuth, messagingHandler.Subscribe)
 	app.Post("/inbox/unsubscribe", requireAuth, messagingHandler.Unsubscribe)
 	app.Get("/inbox/badge", requireAuth, messagingHandler.Badge)
+	app.Get("/inbox/sse", requireAuth, messagingHandler.InboxSSE)
 
 	// ------------------------------------------------------------------
 	// Clerk / Admin routes
@@ -305,6 +343,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/courses/:id", requireAuth, requireInstrOrAdmin, courseHandler.CourseDetail)
 	app.Post("/courses/:id/plan", requireAuth, requireInstrOrAdmin, courseHandler.AddPlanItem)
 	app.Post("/courses/:id/plan/:planID/approve", requireAuth, requireInstrOrAdmin, courseHandler.ApprovePlanItem)
+	app.Post("/courses/:id/sections", requireAuth, requireInstrOrAdmin, courseHandler.AddSection)
 
 	// ------------------------------------------------------------------
 	// Admin-only routes
@@ -336,6 +375,11 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/analytics/map", requireAuth, requireAdmin, analyticsHandler.MapPage)
 	app.Get("/analytics/map/data", requireAuth, requireAdmin, analyticsHandler.MapData)
 	app.Post("/analytics/map/compute", requireAuth, requireAdmin, analyticsHandler.ComputeGrid)
+	app.Get("/analytics/map/buffer", requireAuth, requireAdmin, analyticsHandler.BufferQuery)
+	app.Get("/analytics/map/poi-density", requireAuth, requireAdmin, analyticsHandler.POIDensity)
+	app.Get("/analytics/map/trajectory/:materialID", requireAuth, requireAdmin, analyticsHandler.Trajectory)
+	app.Get("/analytics/map/regions", requireAuth, requireAdmin, analyticsHandler.RegionAggregate)
+	app.Post("/analytics/map/regions/compute", requireAuth, requireAdmin, analyticsHandler.ComputeRegions)
 	app.Get("/analytics/export/orders", requireAuth, requireAdmin, analyticsHandler.ExportOrders)
 	app.Get("/analytics/export/distribution", requireAuth, requireAdmin, analyticsHandler.ExportDistribution)
 	app.Get("/analytics/kpi/:name", requireAuth, requireAdmin, analyticsHandler.KPIHistory)
@@ -424,12 +468,44 @@ func makeRequest(app *fiber.App, method, path, body, cookie, contentType string,
 			req.Header.Set(k, v)
 		}
 	}
+	// For state-changing methods with an authenticated session, automatically
+	// fetch and attach the CSRF token unless the caller already provided one.
+	if cookie != "" && req.Header.Get("X-Csrf-Token") == "" {
+		m := strings.ToUpper(method)
+		if m == http.MethodPost || m == http.MethodPut || m == http.MethodDelete || m == http.MethodPatch {
+			if tok := fetchCSRFToken(app, cookie); tok != "" {
+				req.Header.Set("X-Csrf-Token", tok)
+				req.Header.Set("Cookie", cookie+"; csrf_token="+tok)
+			}
+		}
+	}
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		// Return a synthetic 500 response on internal test errors.
 		return &http.Response{StatusCode: http.StatusInternalServerError}
 	}
 	return resp
+}
+
+// fetchCSRFToken performs a GET to a CSRF-protected route to obtain the
+// csrf_token cookie value. The cookie value IS the token (double-submit pattern).
+// Returns empty string if the request fails or no csrf_token cookie is present.
+func fetchCSRFToken(app *fiber.App, sessionCookie string) string {
+	req := httptest.NewRequest(http.MethodGet, "/materials", nil)
+	if sessionCookie != "" {
+		req.Header.Set("Cookie", sessionCookie)
+	}
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	for _, c := range resp.Cookies() {
+		if c.Name == "csrf_token" {
+			return c.Value
+		}
+	}
+	return ""
 }
 
 // htmxHeaders returns a map with HX-Request: true for use with makeRequest's
@@ -453,6 +529,7 @@ func createTestMaterial(t *testing.T, db *sql.DB) *models.Material {
 		TotalQty:     10,
 		AvailableQty: 10,
 		ReservedQty:  0,
+		Price:        9.99,
 		Status:       "active",
 	}
 	created, err := repo.Create(m)
@@ -473,7 +550,7 @@ func createTestOrder(t *testing.T, db *sql.DB, userID int64) *models.Order {
 	mat := createTestMaterial(t, db)
 	orderRepo := repository.NewOrderRepository(db)
 	order, err := orderRepo.Create(userID, []repository.OrderItemInput{
-		{MaterialID: mat.ID, Qty: 1, UnitPrice: 9.99},
+		{MaterialID: mat.ID, Qty: 1},
 	})
 	if err != nil {
 		t.Fatalf("createTestOrder: %v", err)
@@ -498,6 +575,34 @@ func createTestUser(t *testing.T, db *sql.DB, role string) *models.User {
 		t.Fatalf("createTestUser: %v", err)
 	}
 	return user
+}
+
+// ---------------------------------------------------------------------------
+// loginAsUser logs in an existing user (created via createTestUser) and returns
+// its session cookie. It uses the fixed test password set by createTestUser.
+func loginAsUser(t *testing.T, app *fiber.App, db *sql.DB, user *models.User) string {
+	t.Helper()
+	_ = db // db not needed; user already exists
+	const password = "TestPassword123!"
+	body := fmt.Sprintf("username=%s&password=%s", user.Username, password)
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("loginAsUser: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("loginAsUser: unexpected status %d; body: %s", resp.StatusCode, string(b))
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == "session_token" {
+			return "session_token=" + c.Value
+		}
+	}
+	t.Fatal("loginAsUser: no session_token cookie found")
+	return ""
 }
 
 // ---------------------------------------------------------------------------

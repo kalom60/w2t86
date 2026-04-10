@@ -41,7 +41,7 @@ func seedOrder(t *testing.T, db *sql.DB, status string) int64 {
 	// Place the order (status = pending_payment, inventory reserved).
 	orderRepo := repository.NewOrderRepository(db)
 	order, err := orderRepo.Create(userID, []repository.OrderItemInput{
-		{MaterialID: matID, Qty: 1, UnitPrice: 10.0},
+		{MaterialID: matID, Qty: 1},
 	})
 	if err != nil {
 		t.Fatalf("seedOrder: create order: %v", err)

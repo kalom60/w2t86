@@ -140,13 +140,41 @@ func (r *CourseRepository) UpsertPlanItem(courseID, materialID int64, sectionID 
 }
 
 // ApprovePlanItem sets approved_qty and transitions status to 'approved'.
-func (r *CourseRepository) ApprovePlanItem(planID int64, approvedQty int) error {
+// The query binds both plan_id AND course_id so that an attacker who knows a
+// planID from a different course cannot approve it by guessing the endpoint.
+// Returns an error if no matching pending row is found (wrong course or already
+// approved).
+func (r *CourseRepository) ApprovePlanItem(courseID, planID int64, approvedQty int) error {
 	const q = `
 		UPDATE course_plans
 		SET    approved_qty = ?, status = 'approved', updated_at = datetime('now')
-		WHERE  id = ? AND status = 'pending'`
-	_, err := r.db.Exec(q, approvedQty, planID)
-	return err
+		WHERE  id = ? AND course_id = ? AND status = 'pending'`
+	result, err := r.db.Exec(q, approvedQty, planID, courseID)
+	if err != nil {
+		return fmt.Errorf("repository: ApprovePlanItem: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("repository: ApprovePlanItem: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("repository: ApprovePlanItem: plan %d not found in course %d or already approved", planID, courseID)
+	}
+	return nil
+}
+
+// GetSectionByID returns a single course section by its primary key.
+func (r *CourseRepository) GetSectionByID(id int64) (*models.CourseSection, error) {
+	const q = `SELECT id, course_id, name, period, room, created_at FROM course_sections WHERE id = ?`
+	row := r.db.QueryRow(q, id)
+	s := &models.CourseSection{}
+	if err := row.Scan(&s.ID, &s.CourseID, &s.Name, &s.Period, &s.Room, &s.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("repository: GetSectionByID: section %d not found", id)
+		}
+		return nil, fmt.Errorf("repository: GetSectionByID: %w", err)
+	}
+	return s, nil
 }
 
 // GetPlansByCourse returns all demand plan items for a course, including the

@@ -179,6 +179,50 @@ func (s *AnalyticsService) ComputeGrid(layerType, metric string, gridSizeKm floa
 	return nil
 }
 
+// LocationsWithinRadius returns all locations within radiusKm of the given point.
+func (s *AnalyticsService) LocationsWithinRadius(lat, lng, radiusKm float64, locType string) ([]models.Location, error) {
+	locs, err := s.repo.LocationsWithinRadius(lat, lng, radiusKm, locType)
+	if err != nil {
+		return nil, fmt.Errorf("service: LocationsWithinRadius: %w", err)
+	}
+	return locs, nil
+}
+
+// POIDensityWithinRadius returns a per-type count of locations within radiusKm.
+func (s *AnalyticsService) POIDensityWithinRadius(lat, lng, radiusKm float64) (map[string]int, error) {
+	density, err := s.repo.POIDensityWithinRadius(lat, lng, radiusKm)
+	if err != nil {
+		return nil, fmt.Errorf("service: POIDensityWithinRadius: %w", err)
+	}
+	return density, nil
+}
+
+// TrajectoryPoints returns the ordered custody chain for a material.
+func (s *AnalyticsService) TrajectoryPoints(materialID int64) ([]models.TrajectoryPoint, error) {
+	pts, err := s.repo.TrajectoryPoints(materialID)
+	if err != nil {
+		return nil, fmt.Errorf("service: TrajectoryPoints: %w", err)
+	}
+	return pts, nil
+}
+
+// RegionStats returns order/scan counts per admin-region location.
+func (s *AnalyticsService) RegionStats() ([]models.RegionStat, error) {
+	rs, err := s.repo.RegionStats()
+	if err != nil {
+		return nil, fmt.Errorf("service: RegionStats: %w", err)
+	}
+	return rs, nil
+}
+
+// ComputeRegionAggregation recomputes spatial aggregates for admin regions.
+func (s *AnalyticsService) ComputeRegionAggregation(metric string) error {
+	if err := s.repo.ComputeRegionAggregation(metric); err != nil {
+		return fmt.Errorf("service: ComputeRegionAggregation: %w", err)
+	}
+	return nil
+}
+
 // geoJSONFeature is the internal representation of a GeoJSON Feature.
 type geoJSONFeature struct {
 	Type     string                 `json:"type"`

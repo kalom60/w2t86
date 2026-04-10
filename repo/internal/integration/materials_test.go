@@ -199,9 +199,9 @@ func TestRateMaterial_Success(t *testing.T) {
 	}
 }
 
-// TestRateMaterial_DuplicateUpdates verifies rating the same material twice by
-// the same user upserts (not duplicates) the row and returns 200/302 both times.
-func TestRateMaterial_DuplicateUpdates(t *testing.T) {
+// TestRateMaterial_DuplicateRejected verifies that a second rating by the same
+// user is rejected with 409 and the original rating is preserved.
+func TestRateMaterial_DuplicateRejected(t *testing.T) {
 	app, db, cleanup := newTestApp(t)
 	defer cleanup()
 
@@ -213,20 +213,24 @@ func TestRateMaterial_DuplicateUpdates(t *testing.T) {
 
 	resp1 := makeRequest(app, http.MethodPost, path, "stars=3", cookie, ct)
 	_ = readBody(resp1)
-
-	resp2 := makeRequest(app, http.MethodPost, path, "stars=5", cookie, ct)
-	if resp2.StatusCode != http.StatusOK && resp2.StatusCode != http.StatusFound {
-		t.Fatalf("second rating returned %d", resp2.StatusCode)
+	if resp1.StatusCode != http.StatusOK && resp1.StatusCode != http.StatusFound {
+		t.Fatalf("first rating returned %d", resp1.StatusCode)
 	}
 
-	// DB should have exactly one rating row for this material.
-	var count int
-	err := db.QueryRow(`SELECT COUNT(*) FROM ratings WHERE material_id = ?`, mat.ID).Scan(&count)
+	resp2 := makeRequest(app, http.MethodPost, path, "stars=5", cookie, ct)
+	_ = readBody(resp2)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second rating: expected 409 Conflict, got %d", resp2.StatusCode)
+	}
+
+	// Original stars (3) must be unchanged.
+	var stars int
+	err := db.QueryRow(`SELECT stars FROM ratings WHERE material_id = ?`, mat.ID).Scan(&stars)
 	if err != nil {
 		t.Fatalf("query ratings: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("expected 1 rating row, got %d", count)
+	if stars != 3 {
+		t.Errorf("expected original stars=3, got %d", stars)
 	}
 }
 

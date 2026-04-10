@@ -5,12 +5,18 @@
   </a>
 </div>
 
-{{if .TargetUser}}
-{{with .TargetUser}}
+{{/* Generic entity header — always rendered regardless of entity type */}}
+<div class="d-flex align-items-center gap-2 mb-4">
+  <span class="badge bg-secondary text-capitalize">{{.EntityType}}</span>
+  <h1 class="h4 mb-0">{{.EntityDisplayName}}</h1>
+</div>
+
 <div class="row g-4">
 
-  {{/* Left column: user info card */}}
+  {{/* Left column: user info card — only rendered for user entities */}}
+  {{if .TargetUser}}
   <div class="col-lg-5">
+    {{with .TargetUser}}
     <div class="card mb-4">
       <div class="card-body">
         <h2 class="h4 mb-1">{{.Username}}</h2>
@@ -35,11 +41,12 @@
         <div id="profile-flash" class="mt-2"></div>
       </div>
     </div>
+    {{end}}{{/* end with .TargetUser */}}
   </div>
+  {{end}}{{/* end if .TargetUser */}}
 
-  {{/* Right column: custom fields + audit */}}
-  <div class="col-lg-7">
-{{end}}{{/* end with .TargetUser */}}
+  {{/* Fields + audit column: 7/12 when user info is shown, full-width otherwise */}}
+  <div class="{{if .TargetUser}}col-lg-7{{else}}col-lg-12{{end}}">
 
     {{/* Custom fields section */}}
     <div class="card mb-4">
@@ -79,7 +86,7 @@
                   {{end}}
                 </td>
                 <td>
-                  <form hx-delete="/admin/users/{{$.TargetID}}/fields/{{.FieldName}}"
+                  <form hx-delete="/admin/fields/{{$.EntityType}}/{{$.TargetID}}/{{.FieldName}}"
                         hx-target="#fields-flash"
                         hx-confirm="Delete this field?">
                     <button type="submit"
@@ -101,7 +108,7 @@
 
         <div id="fields-flash" class="mb-2"></div>
 
-        <form hx-post="/admin/users/{{.TargetID}}/fields" hx-target="#fields-flash">
+        <form hx-post="/admin/fields/{{.EntityType}}/{{.TargetID}}" hx-target="#fields-flash">
           <div class="row g-2 align-items-end">
             <div class="col-sm-4">
               <label class="form-label form-label-sm">Field name</label>
@@ -160,7 +167,6 @@
     </div>
     {{end}}
 
-  </div>{{/* end right col */}}
+  </div>{{/* end fields+audit column */}}
 </div>{{/* end row */}}
-{{end}}{{/* end if .TargetUser */}}
 {{end}}

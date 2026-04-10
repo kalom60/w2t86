@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"w2t86/internal/middleware"
 	"w2t86/internal/observability"
 	"w2t86/internal/services"
 )
@@ -70,6 +71,45 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		SameSite: "Strict",
 		Expires:  time.Now().Add(24 * time.Hour),
 	})
+
+	// Force password rotation before allowing access to the application.
+	if user.MustChangePassword == 1 {
+		return c.Redirect("/account/change-password", fiber.StatusFound)
+	}
+
+	return c.Redirect("/dashboard", fiber.StatusFound)
+}
+
+// ChangePasswordPage handles GET /account/change-password.
+// Renders the password change form.
+func (h *AuthHandler) ChangePasswordPage(c *fiber.Ctx) error {
+	return c.Render("account/change_password", fiber.Map{
+		"Title": "Change Password",
+		"Error": "",
+	}, "layouts/main")
+}
+
+// ChangePassword handles POST /account/change-password.
+// Validates the new password, updates the hash, and clears the
+// must_change_password flag before redirecting to /dashboard.
+func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
+	user := middleware.GetUser(c)
+	newPassword := c.FormValue("new_password")
+	confirm := c.FormValue("confirm_password")
+
+	if newPassword != confirm {
+		return c.Status(fiber.StatusUnprocessableEntity).Render("account/change_password", fiber.Map{
+			"Title": "Change Password",
+			"Error": "Passwords do not match.",
+		}, "layouts/main")
+	}
+
+	if err := h.authService.ChangePassword(user.ID, newPassword); err != nil {
+		return c.Status(fiber.StatusUnprocessableEntity).Render("account/change_password", fiber.Map{
+			"Title": "Change Password",
+			"Error": err.Error(),
+		}, "layouts/main")
+	}
 
 	return c.Redirect("/dashboard", fiber.StatusFound)
 }

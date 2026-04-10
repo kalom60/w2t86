@@ -205,7 +205,12 @@
       formData.append('grid_size_km', gridSize);
       formData.append('metric',       metric);
 
-      fetch('/analytics/map/compute', { method: 'POST', body: formData })
+      var csrfToken = (document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/) || [])[1] || '';
+      fetch('/analytics/map/compute', {
+        method: 'POST',
+        headers: { 'X-Csrf-Token': csrfToken },
+        body: formData,
+      })
         .then(function (res) { return res.json(); })
         .then(function (data) {
           if (data.status === 'ok') {

@@ -128,7 +128,10 @@ func (h *CourseHandler) AddPlanItem(c *fiber.Ctx) error {
 		}
 	}
 
-	planItem, err := h.courseService.AddPlanItem(int64(courseID), materialID, sectionID, qty, notes)
+	user := middleware.GetUser(c)
+	isAdmin := user.Role == "admin"
+
+	planItem, err := h.courseService.AddPlanItem(int64(courseID), materialID, sectionID, qty, notes, user.ID, isAdmin)
 	if err != nil {
 		return htmxErr(c, fiber.StatusUnprocessableEntity, "Could not add plan item: "+err.Error())
 	}
@@ -143,8 +146,13 @@ func (h *CourseHandler) AddPlanItem(c *fiber.Ctx) error {
 	return c.Redirect("/courses/"+strconv.Itoa(courseID), fiber.StatusFound)
 }
 
-// ApprovePlanItem handles POST /courses/:id/plan/:planID/approve (admin).
+// ApprovePlanItem handles POST /courses/:id/plan/:planID/approve.
 func (h *CourseHandler) ApprovePlanItem(c *fiber.Ctx) error {
+	courseID, err := c.ParamsInt("id")
+	if err != nil {
+		return apiErr(c, fiber.StatusBadRequest, "Invalid course ID")
+	}
+
 	planID, err := c.ParamsInt("planID")
 	if err != nil {
 		return apiErr(c, fiber.StatusBadRequest, "Invalid plan ID")
@@ -155,7 +163,10 @@ func (h *CourseHandler) ApprovePlanItem(c *fiber.Ctx) error {
 		return htmxErr(c, fiber.StatusBadRequest, "Approved quantity must be non-negative")
 	}
 
-	if err := h.courseService.ApprovePlanItem(int64(planID), qty); err != nil {
+	user := middleware.GetUser(c)
+	isAdmin := user.Role == "admin"
+
+	if err := h.courseService.ApprovePlanItem(int64(courseID), int64(planID), qty, user.ID, isAdmin); err != nil {
 		return htmxErr(c, fiber.StatusUnprocessableEntity, "Could not approve plan item.")
 	}
 
@@ -165,4 +176,37 @@ func (h *CourseHandler) ApprovePlanItem(c *fiber.Ctx) error {
 		})
 	}
 	return c.Redirect(c.Get("Referer", "/courses"), fiber.StatusFound)
+}
+
+// AddSection handles POST /courses/:id/sections — adds a section to the course.
+func (h *CourseHandler) AddSection(c *fiber.Ctx) error {
+	courseID, err := c.ParamsInt("id")
+	if err != nil {
+		return apiErr(c, fiber.StatusBadRequest, "Invalid course ID")
+	}
+
+	user := middleware.GetUser(c)
+	isAdmin := user.Role == "admin"
+
+	if _, err := h.courseService.GetCourse(int64(courseID), user.ID, isAdmin); err != nil {
+		return apiErr(c, fiber.StatusNotFound, "Course not found")
+	}
+
+	name := c.FormValue("name")
+	period := c.FormValue("period")
+	room := c.FormValue("room")
+
+	section, err := h.courseService.AddSection(int64(courseID), name, period, room)
+	if err != nil {
+		return htmxErr(c, fiber.StatusUnprocessableEntity, "Could not add section: "+err.Error())
+	}
+
+	observability.App.Info("course section added", "course_id", courseID, "section_id", section.ID)
+
+	if c.Get("HX-Request") == "true" {
+		return c.Render("partials/flash", fiber.Map{
+			"Message": "Section added.",
+		})
+	}
+	return c.Redirect("/courses/"+strconv.Itoa(courseID), fiber.StatusFound)
 }

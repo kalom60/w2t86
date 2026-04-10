@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"w2t86/internal/crypto"
 )
 
 // TestHealth verifies that GET /health returns 200 {"status":"ok"}.
@@ -199,33 +201,42 @@ func TestRBAC_ClerkCannotAccessAdminUsers(t *testing.T) {
 
 // TestDefaultAdminLogin_SeedCredentialsWork closes the audit gap that requires
 // runtime proof the seeded admin account (migrations/001_schema.sql) can
-// actually log in through the full HTTP stack.
+// actually log in through the full HTTP stack after the bootstrap rotation.
 //
-// The test DB is populated by testutil.NewTestDB which runs 001_schema.sql in
-// full — including the INSERT OR IGNORE that seeds the admin user with the
-// bcrypt hash for "ChangeMe123!".  A POST /login with those credentials must
-// yield a 302 redirect (success) and set a session_token cookie.
-//
-// This complements TestDefaultAdminPassword_MatchesSeedHash (which validates
-// the hash in isolation) by proving that the AuthService, UserRepository, and
-// Fiber handler chain all accept the seed credentials end-to-end.
+// The migration seeds the admin user with the non-functional placeholder
+// "BOOTSTRAP_PENDING_ROTATION".  In production, cmd/server/main.go detects
+// this on startup and replaces it with a freshly-generated bcrypt hash.
+// This test simulates that rotation: it directly updates the admin row with a
+// known bcrypt hash, then proves that the AuthService → UserRepository → Fiber
+// handler chain accepts the resulting credential end-to-end.
 func TestDefaultAdminLogin_SeedCredentialsWork(t *testing.T) {
-	app, _, cleanup := newTestApp(t)
+	app, db, cleanup := newTestApp(t)
 	defer cleanup()
 
-	const (
-		seedUsername = "admin"
-		seedPassword = "ChangeMe123!"
-	)
+	// Simulate the bootstrap auto-rotation: generate a random password, hash
+	// it, and write it directly to the admin row — exactly what main.go does.
+	tmpPass, err := crypto.GenerateRandomPassword()
+	if err != nil {
+		t.Fatalf("GenerateRandomPassword: %v", err)
+	}
+	newHash, err := crypto.HashPassword(tmpPass)
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if _, err := db.Exec(
+		`UPDATE users SET password_hash = ? WHERE username = 'admin'`, newHash,
+	); err != nil {
+		t.Fatalf("update admin password_hash: %v", err)
+	}
 
-	body := "username=" + seedUsername + "&password=" + seedPassword
+	body := "username=admin&password=" + tmpPass
 	resp := makeRequest(app, http.MethodPost, "/login", body, "",
 		"application/x-www-form-urlencoded")
 
 	// Login success → 302 redirect to /dashboard.
 	if resp.StatusCode != http.StatusFound {
 		b := readBody(resp)
-		t.Fatalf("expected 302 for seed admin login, got %d; body: %s", resp.StatusCode, b)
+		t.Fatalf("expected 302 for rotated admin login, got %d; body: %s", resp.StatusCode, b)
 	}
 
 	// A session_token cookie must be set.
@@ -237,13 +248,13 @@ func TestDefaultAdminLogin_SeedCredentialsWork(t *testing.T) {
 		}
 	}
 	if sessionCookie == "" {
-		t.Fatal("no session_token cookie in login response — auth stack did not accept seed credentials")
+		t.Fatal("no session_token cookie in login response — auth stack did not accept rotated credentials")
 	}
 
 	// The cookie must grant access to the admin dashboard.
 	dashResp := makeRequest(app, http.MethodGet, "/dashboard/admin", "", sessionCookie, "")
 	if dashResp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 on /dashboard/admin with seed admin session, got %d",
+		t.Errorf("expected 200 on /dashboard/admin with rotated admin session, got %d",
 			dashResp.StatusCode)
 	}
 }
