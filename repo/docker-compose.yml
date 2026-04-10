@@ -7,13 +7,12 @@ services:
     volumes:
       - portal_data:/app/data
     environment:
-      - PORT=3000
-      - DB_PATH=/app/data/portal.db
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - SESSION_SECRET=${SESSION_SECRET}
-      - APP_ENV=${APP_ENV:-production}
-    env_file:
-      - .env
+      PORT: "3000"
+      DB_PATH: /app/data/portal.db
+      ENCRYPTION_KEY: 4de19a87670bae998e3fad8032f482b6ab7e398619badeaca62f60c3d1b2909f
+      SESSION_SECRET: 3b313b46db2e515092ae0b011172545a20bac5d7df41a8267be537a705b0b66a
+      APP_ENV: production
+      TIMEZONE: UTC
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]

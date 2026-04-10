@@ -1284,10 +1284,163 @@
     }
   ],
   "meta": {
-    "session_file": "/Users/rollin/.claude/projects/-Users-rollin-eaglepoint-w2t86-repo/9ca496ad-8e8d-4e66-93aa-88440fff53fa-bug.jsonl",
+    "session_file": "/Users/rollin/.claude/projects/-Users-rollin-eaglepoint-w2t86-repo/9ca496ad-8e8d-4e66-93aa-88440fff53fa.jsonl",
     "session_id": "9ca496ad-8e8d-4e66-93aa-88440fff53fa",
     "kind": "bug",
     "subagent_count": 1,
-    "merged_messages": 69
+    "merged_messages": 69,
+    "session_meta": {
+      "session_id": "9ca496ad-8e8d-4e66-93aa-88440fff53fa",
+      "version": "2.1.94",
+      "git_branch": "main",
+      "cwd": "/Users/rollin/eaglepoint/w2t86/repo"
+    },
+    "turn_contexts": [
+      {
+        "model": "claude-sonnet-4-6",
+        "approval_policy": "default",
+        "cwd": "/Users/rollin/eaglepoint/w2t86/repo"
+      },
+      {
+        "model": "<synthetic>",
+        "approval_policy": "default",
+        "cwd": "/Users/rollin/eaglepoint/w2t86/repo"
+      }
+    ],
+    "approval_policy": "default",
+    "collaboration_mode": "default",
+    "originator": "cli",
+    "source": "claude-jsonl-merged",
+    "cwd": "/Users/rollin/eaglepoint/w2t86/repo",
+    "token_counts": [
+      {
+        "type": "token_count",
+        "info": {
+          "total_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 6,
+            "total_tokens": 9
+          },
+          "last_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 6,
+            "total_tokens": 9
+          }
+        },
+        "rate_limits": {
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "plan_type": null
+        },
+        "_timestamp": "2026-04-08T06:10:30.462Z"
+      },
+      {
+        "type": "token_count",
+        "info": {
+          "total_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 6,
+            "total_tokens": 9
+          },
+          "last_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 6,
+            "total_tokens": 9
+          }
+        },
+        "rate_limits": {
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "plan_type": null
+        },
+        "_timestamp": "2026-04-08T06:10:30.462Z"
+      },
+      {
+        "type": "token_count",
+        "info": {
+          "total_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 245,
+            "total_tokens": 248
+          },
+          "last_token_usage": {
+            "input_tokens": 3,
+            "cached_input_tokens": 11192,
+            "output_tokens": 245,
+            "total_tokens": 248
+          }
+        },
+        "rate_limits": {
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "plan_type": null
+        },
+        "_timestamp": "2026-04-08T06:10:35.027Z"
+      },
+      {
+        "type": "token_count",
+        "info": {
+          "total_token_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+          },
+          "last_token_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+          }
+        },
+        "rate_limits": {
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "plan_type": null
+        },
+        "_timestamp": "2026-04-08T06:15:58.534Z"
+      },
+      {
+        "type": "token_count",
+        "info": {
+          "total_token_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+          },
+          "last_token_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+          }
+        },
+        "rate_limits": {
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "plan_type": null
+        },
+        "_timestamp": "2026-04-08T06:21:32.706Z"
+      }
+    ],
+    "merge_stats": {
+      "main_messages": 7,
+      "subagent_messages": 62,
+      "merged_messages": 69,
+      "subagent_count": 1,
+      "has_subagents": true,
+      "source_root": "/Users/rollin/.claude/projects/-Users-rollin-eaglepoint-w2t86-repo"
+    }
   }
 }
