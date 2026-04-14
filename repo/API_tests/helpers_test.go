@@ -59,8 +59,11 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 		EncryptionKey: "",
 	}
 
+	courseRepo := repository.NewCourseRepository(db)
+
 	authService := services.NewAuthService(userRepo, sessionRepo, cfg)
 	materialService := services.NewMaterialService(materialRepo, engagementRepo)
+	courseService := services.NewCourseService(courseRepo, materialRepo)
 	orderService := services.NewOrderService(orderRepo, materialRepo)
 	distributionService := services.NewDistributionService(distributionRepo, orderRepo, materialRepo)
 	messagingService := services.NewMessagingService(messagingRepo)
@@ -70,6 +73,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 
 	authHandler := handlers.NewAuthHandler(authService)
 	materialHandler := handlers.NewMaterialHandler(materialService)
+	courseHandler := handlers.NewCourseHandler(courseService)
 	orderHandler := handlers.NewOrderHandler(orderService)
 	distributionHandler := handlers.NewDistributionHandler(distributionService)
 	messagingHandler := handlers.NewMessagingHandler(messagingService, "UTC")
@@ -178,6 +182,8 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/login", authHandler.LoginPage)
 	app.Post("/login", authHandler.Login)
 	app.Post("/logout", requireAuth, authHandler.Logout)
+	app.Get("/account/change-password", requireAuth, authHandler.ChangePasswordPage)
+	app.Post("/account/change-password", requireAuth, authHandler.ChangePassword)
 	app.Get("/dashboard", requireAuth, func(c *fiber.Ctx) error {
 		user := middleware.GetUser(c)
 		switch user.Role {
@@ -190,6 +196,9 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 		}
 	})
 
+	// Browse history.
+	app.Get("/history", requireAuth, materialHandler.BrowseHistory)
+
 	// Materials.
 	app.Get("/materials", requireAuth, materialHandler.ListPage)
 	app.Get("/materials/search", requireAuth, materialHandler.SearchPartial)
@@ -201,6 +210,8 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	// Favorites.
 	app.Get("/favorites", requireAuth, materialHandler.FavoritesList)
 	app.Post("/favorites", requireAuth, materialHandler.CreateFavoritesList)
+	app.Get("/favorites/:id", requireAuth, materialHandler.GetFavoritesListDetail)
+	app.Get("/favorites/:id/items", requireAuth, materialHandler.GetFavoritesListItems)
 	app.Post("/favorites/:id/items", requireAuth, materialHandler.AddToFavorites)
 	app.Delete("/favorites/:id/items/:materialID", requireAuth, materialHandler.RemoveFromFavorites)
 	app.Get("/favorites/:id/share", requireAuth, materialHandler.ShareFavoritesList)
@@ -226,6 +237,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Post("/inbox/subscribe", requireAuth, messagingHandler.Subscribe)
 	app.Post("/inbox/unsubscribe", requireAuth, messagingHandler.Unsubscribe)
 	app.Get("/inbox/badge", requireAuth, messagingHandler.Badge)
+	app.Get("/api/inbox/unread-count", requireAuth, messagingHandler.Badge)
 	app.Get("/inbox/sse", requireAuth, messagingHandler.InboxSSE)
 
 	// Moderation.
@@ -239,6 +251,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Post("/distribution/issue", requireAuth, requireClerk, distributionHandler.IssueItems)
 	app.Post("/distribution/return", requireAuth, requireClerk, distributionHandler.RecordReturn)
 	app.Post("/distribution/exchange", requireAuth, requireClerk, distributionHandler.RecordExchange)
+	app.Get("/distribution/reissue", requireAuth, requireClerk, distributionHandler.ReissueForm)
 	app.Post("/distribution/reissue", requireAuth, requireClerk, distributionHandler.ReissueItem)
 	app.Get("/distribution/ledger", requireAuth, requireClerk, distributionHandler.Ledger)
 	app.Get("/distribution/ledger/search", requireAuth, requireClerk, distributionHandler.LedgerSearch)
@@ -250,26 +263,49 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/admin/orders", requireAuth, requireClerk, orderHandler.AdminListOrders)
 	app.Post("/admin/orders/:id/ship", requireAuth, requireClerk, orderHandler.MarkShipped)
 	app.Post("/admin/orders/:id/deliver", requireAuth, requireClerk, orderHandler.MarkDelivered)
+	app.Post("/admin/orders/:id/cancel", requireAuth, requireInstr, orderHandler.AdminCancelOrder)
 	app.Get("/admin/returns", requireAuth, requireInstr, orderHandler.AdminListReturnRequests)
 	app.Post("/admin/returns/:id/approve", requireAuth, requireInstr, orderHandler.ApproveReturn)
 	app.Post("/admin/returns/:id/reject", requireAuth, requireInstr, orderHandler.RejectReturn)
+
+	// Courses.
+	app.Get("/courses", requireAuth, requireInstr, courseHandler.ListCourses)
+	app.Get("/courses/new", requireAuth, requireInstr, courseHandler.NewCourseForm)
+	app.Post("/courses", requireAuth, requireInstr, courseHandler.CreateCourse)
+	app.Get("/courses/:id", requireAuth, requireInstr, courseHandler.CourseDetail)
+	app.Post("/courses/:id/plan", requireAuth, requireInstr, courseHandler.AddPlanItem)
+	app.Post("/courses/:id/plan/:planID/approve", requireAuth, requireInstr, courseHandler.ApprovePlanItem)
+	app.Post("/courses/:id/sections", requireAuth, requireInstr, courseHandler.AddSection)
+
+	// Materials management (admin).
 	app.Get("/admin/materials/new", requireAuth, requireAdmin, materialHandler.NewMaterialForm)
 	app.Post("/admin/materials", requireAuth, requireAdmin, materialHandler.CreateMaterial)
 	app.Get("/admin/materials/:id/edit", requireAuth, requireAdmin, materialHandler.EditMaterialForm)
 	app.Put("/admin/materials/:id", requireAuth, requireAdmin, materialHandler.UpdateMaterial)
 	app.Delete("/admin/materials/:id", requireAuth, requireAdmin, materialHandler.DeleteMaterial)
+
+	// User management (admin).
 	app.Get("/admin/users", requireAuth, requireAdmin, adminHandler.ListUsers)
 	app.Get("/admin/users/new", requireAuth, requireAdmin, adminHandler.NewUserForm)
 	app.Post("/admin/users", requireAuth, requireAdmin, adminHandler.CreateUser)
 	app.Get("/admin/users/:id", requireAuth, requireAdmin, adminHandler.UserProfile)
 	app.Post("/admin/users/:id/role", requireAuth, requireAdmin, adminHandler.UpdateRole)
 	app.Post("/admin/users/:id/unlock", requireAuth, requireAdmin, adminHandler.UnlockUser)
+
+	// Generic custom fields (admin).
+	app.Get("/admin/fields/:entity_type/:entity_id", requireAuth, requireAdmin, adminHandler.CustomFieldsPage)
+	app.Post("/admin/fields/:entity_type/:entity_id", requireAuth, requireAdmin, adminHandler.SetCustomField)
+	app.Delete("/admin/fields/:entity_type/:entity_id/:name", requireAuth, requireAdmin, adminHandler.DeleteCustomField)
+	// Legacy user-scoped aliases.
 	app.Get("/admin/users/:id/fields", requireAuth, requireAdmin, adminHandler.CustomFieldsPage)
 	app.Post("/admin/users/:id/fields", requireAuth, requireAdmin, adminHandler.SetCustomField)
 	app.Delete("/admin/users/:id/fields/:name", requireAuth, requireAdmin, adminHandler.DeleteCustomField)
+
 	app.Get("/admin/duplicates", requireAuth, requireAdmin, adminHandler.DuplicatesPage)
 	app.Post("/admin/duplicates/merge", requireAuth, requireAdmin, adminHandler.MergeUsers)
 	app.Get("/admin/audit", requireAuth, requireAdmin, adminHandler.AuditLogPage)
+	app.Get("/admin/audit/:entityType/:entityID", requireAuth, requireAdmin, adminHandler.EntityAuditLog)
+
 	app.Get("/metrics", requireAuth, requireAdmin, func(c *fiber.Ctx) error {
 		return c.JSON(observability.M.ToJSON())
 	})
@@ -284,6 +320,7 @@ func newTestApp(t *testing.T) (*fiber.App, *sql.DB, func()) {
 	app.Get("/analytics/map/trajectory/:materialID", requireAuth, requireAdmin, analyticsHandler.Trajectory)
 	app.Get("/analytics/map/regions", requireAuth, requireAdmin, analyticsHandler.RegionAggregate)
 	app.Post("/analytics/map/regions/compute", requireAuth, requireAdmin, analyticsHandler.ComputeRegions)
+	app.Get("/analytics/kpi/:name", requireAuth, requireAdmin, analyticsHandler.KPIHistory)
 
 	return app, db, func() {}
 }

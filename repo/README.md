@@ -187,6 +187,28 @@ cryptographically-random password, and logs it **once** as a structured log line
 > log in, and change the password via the Admin Settings page. The account is flagged
 > `must_change_password = 1` so the first login forces an immediate password reset.
 
+## Demo Credentials (Development / Evaluation)
+
+After the admin account is set up, you can create demo accounts for every role via
+**Admin → Users → New User** (or the API). For a quick local evaluation, the following
+accounts are a suggested starting point — use passwords that satisfy the minimum-length
+requirement (8+ characters):
+
+| Username      | Suggested password | Role        | What you can explore |
+|---------------|--------------------|-------------|----------------------|
+| `demo_student`    | `Demo1234!`    | student     | Browse materials, place and track orders, manage favorites, inbox |
+| `demo_instructor` | `Demo1234!`    | instructor  | Course plans, approve / reject return requests, admin order views |
+| `demo_clerk`      | `Demo1234!`    | clerk       | Distribution events, ledger, reissue / exchange workflows |
+| `demo_moderator`  | `Demo1234!`    | moderator   | Reported-comment review queue |
+| `demo_manager`    | `Demo1234!`    | manager     | Approve / reject return and refund requests |
+
+> These accounts are **not** seeded automatically. Create them once through the admin panel
+> (or with a one-off SQL seed script), and they persist in the SQLite database across
+> server restarts.
+>
+> In the automated test suite every test creates its own short-lived users via the
+> `loginAs` helper, so no shared demo accounts are needed there.
+
 ## Available Roles
 
 | Role         | Capabilities                                                                                                           |
